@@ -1,22 +1,26 @@
-# Dockerfile.api
+# Dockerfile.api — image pour l'API FastAPI (credit_api.py)
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
 
-# OS deps (reportlab a parfois besoin de fonts)
+# (polices utiles pour reportlab/pdf)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
+# 1) installer les dépendances
 COPY requirements.txt /app/requirements.txt
 RUN python -m pip install --upgrade pip && pip install -r requirements.txt
 
-# copie du code et des artefacts (modèles + data démo)
-COPY credit_api.py dashboard_streamlit_app.py /app/
-COPY model_baseline_logreg.joblib model_calibrated_isotonic.joblib model_calibrated_sigmoid.joblib /app/
-COPY clients_demo.csv clients_demo.parquet global_importance.csv feature_names.npy interpretability_summary.json /app/ 2>/dev/null || true
+# 2) copier tout le code + artefacts (modèles, clients_demo…)
+COPY . /app/
 
+# 3) exposer le port API
 EXPOSE 8000
+
+# 4) démarrer l'API
 CMD ["uvicorn", "credit_api:app", "--host", "0.0.0.0", "--port", "8000"]
