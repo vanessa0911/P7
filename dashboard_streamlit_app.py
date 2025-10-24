@@ -164,6 +164,24 @@ def prob_to_band(p: float, low=0.05, high=0.15) -> Tuple[str, str]:
 # -------------------------------
 # Load artifacts
 # -------------------------------
+
+# Try to introspect expected input columns from a sklearn Pipeline/ColumnTransformer
+from sklearn.pipeline import Pipeline as SkPipeline
+from sklearn.compose import ColumnTransformer as SkColumnTransformer
+
+def get_expected_input_columns(model) -> Optional[List[str]]:
+    try:
+        m = model
+        if isinstance(m, SkPipeline):
+            for name, step in m.steps:
+                if isinstance(step, SkColumnTransformer):
+                    if hasattr(step, "feature_names_in_"):
+                        return list(step.feature_names_in_)
+        if hasattr(m, "feature_names_in_"):
+            return list(m.feature_names_in_)
+    except Exception:
+        pass
+    return None
 DATA_TRAIN = _pick_first_existing([
     "application_train_clean.csv",
     "clients_demo.csv",
@@ -239,8 +257,21 @@ with st.sidebar:
     st.caption("Astuce : utilisez le champ de recherche pour filtrer par ID.")
 
 # Core: Prepare X, x_row, background
-if not train_df.empty and selected_id is not None:
-    X = pool_df.set_index(ID_COL)[feature_names]
+if not pool_df.empty and selected_id is not None:
+    df_idx = pool_df.set_index(ID_COL)
+    # Determine input columns expected by the selected model (if already loaded) or fall back to feature_names
+    temp_model = None
+    if model_name in (model_paths or {}):
+        try:
+            temp_model = safe_load_model(model_paths[model_name])
+        except Exception:
+            temp_model = None
+    expected_cols = get_expected_input_columns(temp_model) or feature_names
+    # Ensure all expected columns exist (create missing as NaN) and order them
+    for c in expected_cols:
+        if c not in df_idx.columns:
+            df_idx[c] = np.nan
+    X = df_idx[expected_cols]
     x_row = X.loc[[selected_id]]  # DataFrame with one row
     # background sample for SHAP / cohort
     background = X.sample(min(500, len(X)), random_state=42)
@@ -250,6 +281,21 @@ else:
     background = X
 
 # Load selected model lazily to avoid importing heavy deps unless needed
+model = None
+if model_name in (model_paths or {}):
+    try:
+        model = safe_load_model(model_paths[model_name])
+    except Exception:
+        model = None
+
+# Prediction
+proba = None
+if model is not None and not x_row.empty:
+    # Always feed the model its expected raw inputs (the pipeline will preprocess)
+    proba = float(model.predict_proba(x_row)[0, 1])
+
+# Tabs
+main_tabs = st.tabs(["📈 Score & explication", "🧑‍💼 Fiche client", "⚖️ Comparaison", "🌍 Insights globaux", "🧪 Qualité des données"]) # Load selected model lazily to avoid importing heavy deps unless needed
 model = None
 if model_name in (model_paths or {}):
     try:
@@ -305,9 +351,9 @@ with main_tabs[0]:
             st.markdown("**Contributions locales (SHAP)** — top 10")
             if not background.empty:
                 try:
-                    vals, base_vals = compute_local_shap(model, background[feature_names], x_row[feature_names])
+                    vals, base_vals = compute_local_shap(model, background[X.columns], x_row[X.columns])
                     local_df = pd.DataFrame({
-                        "feature": feature_names,
+                        "feature": list(X.columns),
                         "shap_value": vals,
                         "abs_val": np.abs(vals),
                         "value": x_row.iloc[0].values,
@@ -453,4 +499,3 @@ with left:
     st.caption("© Prêt à dépenser — Dashboard pédagogique. Ce tableau de bord vise la transparence et l'explicabilité des décisions d'octroi.")
 with right:
     st.caption("Build: Streamlit + SHAP + scikit-learn")
- 
