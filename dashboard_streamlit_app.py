@@ -1,4 +1,4 @@
-# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v0.7.3)
+# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v0.8.0)
 # ----------------------------------------------------------------
 # Run:
 #   python -m streamlit run dashboard_streamlit_app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true
@@ -10,13 +10,14 @@
 # - Global importance (optional): global_importance.csv  (columns: feature, importance)
 # - Interpretability (optional): interpretability_summary.json
 
-APP_VERSION = "0.7.3"
+APP_VERSION = "0.8.0"
 
 import os
 import json
 import subprocess
 import hashlib
 from datetime import datetime
+from io import BytesIO
 
 import numpy as np
 import pandas as pd
@@ -33,6 +34,17 @@ from sklearn.metrics import (
     precision_recall_curve, roc_curve, roc_auc_score, confusion_matrix,
     precision_score, recall_score, f1_score
 )
+
+# --- PDF (ReportLab) ---
+try:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.units import cm
+    REPORTLAB_AVAILABLE = True
+except Exception:
+    REPORTLAB_AVAILABLE = False
 
 st.set_page_config(page_title="Prêt à dépenser — Credit Scoring", page_icon="💳", layout="wide")
 
@@ -157,12 +169,6 @@ def compute_local_shap(estimator, X_background: pd.DataFrame, x_row: pd.DataFram
 
 # ---- quantiles robustes (évite les KeyError) ----
 def get_quantile_series(feature: str, pool_df: pd.DataFrame, X: pd.DataFrame) -> Optional[pd.Series]:
-    """
-    Série utilisée pour les quantiles :
-    - priorité au dataset brut pool_df si la colonne est présente et numérique
-    - sinon bascule sur X (colonnes alignées au modèle)
-    - sinon None
-    """
     if feature in pool_df.columns and pd.api.types.is_numeric_dtype(pool_df[feature]):
         return pool_df[feature]
     if feature in X.columns and pd.api.types.is_numeric_dtype(X[feature]):
@@ -170,10 +176,6 @@ def get_quantile_series(feature: str, pool_df: pd.DataFrame, X: pd.DataFrame) ->
     return None
 
 def get_cohort_series(feature: str, cohort_df: pd.DataFrame, X: pd.DataFrame, ID_COL: Optional[str]) -> Optional[pd.Series]:
-    """
-    Série pour la cohorte (mêmes règles que ci-dessus). Si la colonne n’est pas dans cohort_df,
-    on la récupère via X en filtrant sur les IDs de la cohorte.
-    """
     if feature in cohort_df.columns and pd.api.types.is_numeric_dtype(cohort_df[feature]):
         return cohort_df[feature]
     if ID_COL and ID_COL in cohort_df.columns and feature in X.columns:
@@ -191,9 +193,7 @@ def prob_to_band(p: float, low=0.05, high=0.15) -> Tuple[str, str]:
 
 # ---- coût métier ----
 def cost_at_threshold(y_true: np.ndarray, p: np.ndarray, t: float, cost_fp: float, cost_fn: float):
-    """Calcule coût total + métriques au seuil t."""
     y_pred = (p >= t).astype(int)  # 1 = défaut prédit (refus)
-    # Labels: 1 = défaut réel
     tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0,1]).ravel()
     cost = fp * cost_fp + fn * cost_fn
     prec = precision_score(y_true, y_pred, zero_division=0)
@@ -203,7 +203,6 @@ def cost_at_threshold(y_true: np.ndarray, p: np.ndarray, t: float, cost_fp: floa
                 precision=float(prec), recall=float(rec), f1=float(f1))
 
 def cost_curve(y_true: np.ndarray, p: np.ndarray, cost_fp: float, cost_fn: float, step: float=0.001):
-    """Balaye les seuils [0,1] et retourne DataFrame coût vs seuil + seuil optimal."""
     step = float(step)
     if step <= 0:
         step = 0.001
@@ -214,12 +213,148 @@ def cost_curve(y_true: np.ndarray, p: np.ndarray, cost_fp: float, cost_fn: float
         m["threshold"] = float(t)
         rows.append(m)
     df = pd.DataFrame(rows)
-    # Robust min selection (no Series.idx_* calls)
     cost_arr = pd.to_numeric(df["cost"], errors="coerce").to_numpy()
-    cost_arr = np.where(np.isfinite(cost_arr), cost_arr, np.inf)  # replace NaN by +inf
+    cost_arr = np.where(np.isfinite(cost_arr), cost_arr, np.inf)
     best_pos = int(np.argmin(cost_arr))
     best = df.iloc[best_pos].to_dict()
     return df, best
+
+# ---- PDF builder ----
+def build_client_report_pdf(
+    client_id: str,
+    model_name: str,
+    threshold: float,
+    proba: Optional[float],
+    x_row: pd.DataFrame,
+    X: pd.DataFrame,
+    pool_df: pd.DataFrame,
+    global_imp_df: Optional[pd.DataFrame],
+    shap_vals: Optional[pd.DataFrame] = None,
+) -> bytes:
+    """
+    Construit un PDF (bytes) : score, décision, top10 contributions, variables clés, comparaisons P10/P50/P90.
+    """
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=1.5*cm, rightMargin=1.5*cm, topMargin=1.2*cm, bottomMargin=1.2*cm)
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="TitleBig", fontSize=18, leading=22, spaceAfter=12, alignment=1))  # centered
+    styles.add(ParagraphStyle(name="H2", fontSize=13, leading=16, spaceBefore=10, spaceAfter=6))
+    styles.add(ParagraphStyle(name="Small", fontSize=9, leading=12, textColor="#555555"))
+
+    story = []
+    story.append(Paragraph("Prêt à dépenser — Fiche client", styles["TitleBig"]))
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    header = f"Date: {now} • App: {APP_VERSION} • Modèle: {model_name} • Client: {client_id}"
+    story.append(Paragraph(header, styles["Small"]))
+    story.append(Spacer(1, 8))
+
+    # Score & décision
+    story.append(Paragraph("Score & décision", styles["H2"]))
+    if proba is not None:
+        decision = "Refus" if proba >= threshold else "Accord"
+        band, _ = prob_to_band(proba)
+        tbl = [
+            ["Probabilité de défaut", f"{proba*100:.2f} %"],
+            ["Seuil (proba défaut)", f"{threshold:.3f}"],
+            ["Décision", decision],
+            ["Niveau de risque", band],
+        ]
+    else:
+        tbl = [["Probabilité de défaut", "—"], ["Seuil", f"{threshold:.3f}"], ["Décision", "—"], ["Niveau de risque", "—"]]
+    t = Table(tbl, hAlign="LEFT", colWidths=[7*cm, 7*cm])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
+        ("BOX", (0,0), (-1,-1), 0.25, colors.black),
+        ("INNERGRID", (0,0), (-1,-1), 0.25, colors.grey),
+        ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
+        ("FONTSIZE", (0,0), (-1,-1), 10),
+    ]))
+    story.append(t)
+    story.append(Spacer(1, 8))
+
+    # Contributions locales (SHAP) ou fallback global
+    story.append(Paragraph("Contributions locales (top 10)", styles["H2"]))
+    if shap_vals is not None and not shap_vals.empty:
+        dfc = shap_vals.sort_values("abs_val", ascending=False).head(10).copy()
+        dfc["effet"] = dfc["shap_value"].apply(lambda v: "↑ risque" if v > 0 else ("↓ risque" if v < 0 else "neutre"))
+        data = [["Variable", "Valeur", "Contribution", "Effet"]] + \
+               [[str(r["feature"]), str(r["value"]), f'{r["shap_value"]:+.4f}', r["effet"]] for _, r in dfc.iterrows()]
+    elif global_imp_df is not None and not global_imp_df.empty:
+        dfc = global_imp_df.head(10)
+        data = [["Variable", "Importance"]] + [[str(r["feature"]), f'{r["importance"]:.4f}'] for _, r in dfc.iterrows()]
+    else:
+        data = [["Information", "Détail"], ["Explicabilité", "Indisponible"]]
+    t2 = Table(data, hAlign="LEFT", colWidths=[7*cm, 3.5*cm, 3.5*cm, 2*cm] if len(data[0])==4 else [10*cm, 4*cm])
+    t2.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
+        ("BOX", (0,0), (-1,-1), 0.25, colors.black),
+        ("INNERGRID", (0,0), (-1,-1), 0.25, colors.grey),
+        ("ALIGN", (2,1), (2,-1), "RIGHT"),
+        ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
+        ("FONTSIZE", (0,0), (-1,-1), 9),
+    ]))
+    story.append(t2)
+    story.append(Spacer(1, 8))
+
+    # Variables clés
+    story.append(Paragraph("Variables clés", styles["H2"]))
+    if global_imp_df is not None and not global_imp_df.empty:
+        keys = [f for f in global_imp_df["feature"].tolist() if f in X.columns][:20]
+    else:
+        keys = list(X.columns)[:20]
+    kv = [["Variable", "Valeur"]]
+    row = x_row.iloc[0] if not x_row.empty else pd.Series(dtype=object)
+    for f in keys:
+        v = row[f] if f in row.index else np.nan
+        kv.append([str(f), "" if pd.isna(v) else str(v)])
+    t3 = Table(kv, hAlign="LEFT", colWidths=[9*cm, 5*cm])
+    t3.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
+        ("BOX", (0,0), (-1,-1), 0.25, colors.black),
+        ("INNERGRID", (0,0), (-1,-1), 0.25, colors.grey),
+        ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
+        ("FONTSIZE", (0,0), (-1,-1), 9),
+    ]))
+    story.append(t3)
+    story.append(Spacer(1, 8))
+
+    # Comparaisons P10/P50/P90 (sur 6 features max)
+    story.append(Paragraph("Positionnement vs population (P10 / P50 / P90)", styles["H2"]))
+    if global_imp_df is not None and not global_imp_df.empty:
+        comp_feats = [f for f in global_imp_df["feature"].tolist() if f in X.columns and pd.api.types.is_numeric_dtype(X[f])][:6]
+    else:
+        comp_feats = [f for f in list(X.columns) if pd.api.types.is_numeric_dtype(X[f])][:6]
+
+    comp_tbl = [["Variable", "P10", "P50", "P90", "Client"]]
+    for f in comp_feats:
+        s = X[f].dropna()
+        if s.empty:
+            continue
+        p10, p50, p90 = np.nanpercentile(s.values, [10, 50, 90])
+        client_val = row[f] if f in row.index else np.nan
+        comp_tbl.append([str(f),
+                         f"{p10:.4g}" if pd.notnull(p10) else "—",
+                         f"{p50:.4g}" if pd.notnull(p50) else "—",
+                         f"{p90:.4g}" if pd.notnull(p90) else "—",
+                         f"{client_val:.4g}" if pd.notnull(client_val) else "—"])
+    if len(comp_tbl) == 1:
+        comp_tbl.append(["—", "—", "—", "—", "—"])
+
+    t4 = Table(comp_tbl, hAlign="LEFT", colWidths=[6*cm, 2.5*cm, 2.5*cm, 2.5*cm, 2.5*cm])
+    t4.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
+        ("BOX", (0,0), (-1,-1), 0.25, colors.black),
+        ("INNERGRID", (0,0), (-1,-1), 0.25, colors.grey),
+        ("ALIGN", (1,1), (-1,-1), "RIGHT"),
+        ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
+        ("FONTSIZE", (0,0), (-1,-1), 9),
+    ]))
+    story.append(t4)
+
+    doc.build(story)
+    pdf_bytes = buf.getvalue()
+    buf.close()
+    return pdf_bytes
 
 # -------------------------------
 # Locate artifacts at repo root (no folders required)
@@ -370,16 +505,17 @@ with main_tabs[0]:
             st.markdown("**Contributions locales (SHAP)** — top 10")
             shap_enabled = st.toggle("Activer SHAP (expérimental)", value=False,
                                      help="Active l'explication locale. Peut être lent selon le modèle.")
+            shap_df = None
             if shap_enabled and not background.empty and model is not None:
                 try:
                     vals, base_vals = compute_local_shap(model, background, x_row)
-                    local_df = pd.DataFrame({
+                    shap_df = pd.DataFrame({
                         "feature": list(X.columns),
                         "shap_value": vals,
                         "abs_val": np.abs(vals),
                         "value": x_row.iloc[0].values,
-                    }).sort_values("abs_val", ascending=False).head(10)
-                    bar = px.bar(local_df[::-1], x="shap_value", y="feature", orientation="h",
+                    }).sort_values("abs_val", ascending=False)
+                    bar = px.bar(shap_df.head(10)[::-1], x="shap_value", y="feature", orientation="h",
                                  hover_data={"value": True, "abs_val": False},
                                  title="Impact sur le score (positif = ↑ risque)")
                     st.plotly_chart(bar, use_container_width=True)
@@ -390,6 +526,36 @@ with main_tabs[0]:
                     st.dataframe(global_imp_df.head(10))
                 else:
                     st.info("Importance globale indisponible.")
+
+        st.divider()
+        # -------- Export PDF ----------
+        st.subheader("📄 Export")
+        if not REPORTLAB_AVAILABLE:
+            st.warning("Le module **reportlab** n'est pas installé. Installez-le avec : `pip install reportlab` puis relancez l'app.")
+        else:
+            try:
+                client_id_str = str(selected_id) if selected_id is not None else "NA"
+                pdf_bytes = build_client_report_pdf(
+                    client_id=client_id_str,
+                    model_name=model_name,
+                    threshold=float(threshold),
+                    proba=proba,
+                    x_row=x_row,
+                    X=X,
+                    pool_df=pool_df,
+                    global_imp_df=global_imp_df,
+                    shap_vals=(shap_df if shap_enabled and shap_df is not None else None),
+                )
+                filename = f"fiche_client_{client_id_str}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+                st.download_button(
+                    label="📄 Exporter la fiche client (PDF)",
+                    data=pdf_bytes,
+                    file_name=filename,
+                    mime="application/pdf",
+                    use_container_width=True
+                )
+            except Exception as e:
+                st.error(f"Échec de la génération du PDF : {e}")
 
 # -------------------------------
 # Tab 2 — Client sheet
@@ -491,7 +657,7 @@ with main_tabs[3]:
     ]
     for p in figs:
         if p:
-            st.image(p, use_column_width=True)
+            st.image(p, use_container_width=True)
 
 # -------------------------------
 # Tab 5 — Data quality
@@ -500,7 +666,7 @@ with main_tabs[4]:
     st.subheader("Qualité des données & valeurs manquantes")
     miss_fig = _pick_first_existing(["__results___5_1.png", "missing_train.png"])
     if miss_fig:
-        st.image(miss_fig, caption="Top taux de valeurs manquantes (train)", use_column_width=True)
+        st.image(miss_fig, caption="Top taux de valeurs manquantes (train)", use_container_width=True)
     else:
         st.info("Figure de valeurs manquantes non trouvée.")
     st.markdown("""
@@ -654,7 +820,7 @@ with main_tabs[6]:
                 if c not in df_lab.columns:
                     df_lab[c] = np.nan
             X_all = df_lab[expected]
-            y_all = df_lab[TARGET_COL].astype(int)  # aligné sur le même index
+            y_all = df_lab[TARGET_COL].astype(int)
 
             if len(X_all) > max_sample:
                 X_all = X_all.sample(int(max_sample), random_state=42)
