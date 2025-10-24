@@ -45,8 +45,12 @@ def _pick_first_existing(paths: List[str]) -> Optional[str]:
     return None
 
 @st.cache_data(show_spinner=False)
-def load_csv(path: str) -> pd.DataFrame:
-    return pd.read_csv(path)
+def load_table(path: str) -> pd.DataFrame:
+    ext = os.path.splitext(path)[1].lower()
+    if ext in [".parquet", ".pq"]:
+        return pd.read_parquet(path)
+    else:
+        return pd.read_csv(path)
 
 @st.cache_resource(show_spinner=False)
 def load_model(path: str):
@@ -149,8 +153,20 @@ def prob_to_band(p: float, low=0.05, high=0.15) -> Tuple[str, str]:
 # -------------------------------
 # Load artifacts
 # -------------------------------
-DATA_TRAIN = _pick_first_existing(["application_train_clean.csv", "data/application_train_clean.csv", "./data/application_train_clean.csv"]) 
-DATA_TEST  = _pick_first_existing(["application_test_clean.csv", "data/application_test_clean.csv", "./data/application_test_clean.csv"]) 
+DATA_TRAIN = _pick_first_existing([
+    "application_train_clean.csv",
+    "clients_demo.csv",
+    "clients_demo.parquet",
+    "data/application_train_clean.csv",
+    "data/clients_demo.csv",
+    "data/clients_demo.parquet",
+    "./data/application_train_clean.csv"
+]) 
+DATA_TEST  = _pick_first_existing([
+    "application_test_clean.csv",
+    "data/application_test_clean.csv",
+    "./data/application_test_clean.csv"
+])  
 MODEL_ISO  = _pick_first_existing(["model_calibrated_isotonic.joblib", "models/model_calibrated_isotonic.joblib"]) 
 MODEL_SIG  = _pick_first_existing(["model_calibrated_sigmoid.joblib", "models/model_calibrated_sigmoid.joblib"]) 
 MODEL_BASE = _pick_first_existing(["model_baseline_logreg.joblib", "models/model_baseline_logreg.joblib"]) 
@@ -171,9 +187,9 @@ with st.sidebar:
             st.error(f"⚠️ Asset manquant : {label}")
 
 # Load datasets
-train_df = load_csv(DATA_TRAIN) if DATA_TRAIN else pd.DataFrame()
+train_df = load_table(DATA_TRAIN) if DATA_TRAIN else pd.DataFrame()
 # Optional test/holdout
-holdout_df = load_csv(DATA_TEST) if DATA_TEST else pd.DataFrame()
+holdout_df = load_table(DATA_TEST) if DATA_TEST else pd.DataFrame()
 
 # Prepare feature list
 feature_names = load_feature_names(FEATS_PATH, list(train_df.columns) if not train_df.empty else list(holdout_df.columns))
