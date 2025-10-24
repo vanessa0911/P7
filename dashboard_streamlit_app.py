@@ -1,4 +1,4 @@
-# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v0.6.0)
+# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v0.7.0)
 # ----------------------------------------------------------------
 # Run:
 #   python -m streamlit run dashboard_streamlit_app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true
@@ -10,7 +10,7 @@
 # - Global importance (optional): global_importance.csv  (columns: feature, importance)
 # - Interpretability (optional): interpretability_summary.json
 
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.7.0"
 
 import os
 import json
@@ -25,6 +25,10 @@ from typing import List, Optional, Tuple
 
 from sklearn.pipeline import Pipeline as SkPipeline
 from sklearn.compose import ColumnTransformer as SkColumnTransformer
+from sklearn.metrics import (
+    precision_recall_curve, roc_curve, roc_auc_score, confusion_matrix,
+    precision_score, recall_score, f1_score
+)
 
 st.set_page_config(page_title="Prêt à dépenser — Credit Scoring", page_icon="💳", layout="wide")
 
@@ -159,6 +163,32 @@ def prob_to_band(p: float, low=0.05, high=0.15) -> Tuple[str, str]:
         return ("Modérée", "#E6B800")
     return ("Élevée", "#E74C3C")
 
+# ---- coût métier ----
+
+def cost_at_threshold(y_true: np.ndarray, p: np.ndarray, t: float, cost_fp: float, cost_fn: float):
+    """Calcule coût total + métriques au seuil t."""
+    y_pred = (p >= t).astype(int)  # 1 = défaut prédit (refus)
+    # Labels: 1 = défaut réel
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0,1]).ravel()
+    cost = fp * cost_fp + fn * cost_fn
+    prec = precision_score(y_true, y_pred, zero_division=0)
+    rec  = recall_score(y_true, y_pred, zero_division=0)
+    f1   = f1_score(y_true, y_pred, zero_division=0)
+    return dict(cost=cost, tn=tn, fp=fp, fn=fn, tp=tp, precision=prec, recall=rec, f1=f1)
+
+def cost_curve(y_true: np.ndarray, p: np.ndarray, cost_fp: float, cost_fn: float, step: float=0.001):
+    """Balaye les seuils [0,1] et retourne DataFrame coût vs seuil + seuil optimal."""
+    ts = np.arange(0.0, 1.0+step, step)
+    rows = []
+    for t in ts:
+        m = cost_at_threshold(y_true, p, t, cost_fp, cost_fn)
+        m["threshold"] = t
+        rows.append(m)
+    df = pd.DataFrame(rows)
+    best_idx = df["cost"].idx_min()
+    best = df.loc[best_idx].to_dict()
+    return df, best
+
 # -------------------------------
 # Locate artifacts at repo root (no folders required)
 # -------------------------------
@@ -194,7 +224,7 @@ feature_names = load_feature_names(FEATS_PATH, list(pool_df.columns)) if not poo
 model_paths = {}
 if MODEL_ISO: model_paths["Calibré (Isotonic)"] = MODEL_ISO
 if MODEL_SIG: model_paths["Calibré (Sigmoid)"]  = MODEL_SIG
-if MODEL_BASE: model_paths["Baseline"]           = MODEL_BASE
+if MODEL_BASE: model_paths["Baseline"]          = MODEL_BASE
 
 # Interpretability artifacts
 global_imp_df = load_global_importance(GLOBIMP)
@@ -204,11 +234,12 @@ interp_summary = load_interpretability_summary(INTERP_SUM)
 ID_COL = "SK_ID_CURR" if (not pool_df.empty and "SK_ID_CURR" in pool_df.columns) else (pool_df.columns[0] if not pool_df.empty else None)
 TARGET_COL = "TARGET" if (not pool_df.empty and "TARGET" in pool_df.columns) else None
 
-# Sidebar controls
+# Sidebar controls (with session_state to allow programmatic update)
 with st.sidebar:
     st.subheader("Paramètres du modèle (choix)")
     model_name = st.selectbox("Choisir le modèle", list(model_paths.keys()) if model_paths else ["—"])
-    threshold = st.slider("Seuil d'acceptation (proba défaut)", 0.0, 0.5, 0.08, 0.005,
+    default_thresh = st.session_state.get("threshold", 0.08)
+    threshold = st.slider("Seuil d'acceptation (proba défaut)", 0.0, 0.5, float(default_thresh), 0.005, key="threshold",
                           help="Au-delà du seuil = risque élevé ⇒ refus")
     st.divider()
     st.subheader("Sélection du client")
@@ -256,6 +287,7 @@ TABS = [
     "🌍 Insights globaux",
     "🧪 Qualité des données",
     "🆕 Nouveau client",
+    "💰 Seuil & coût métier",
 ]
 main_tabs = st.tabs(TABS)
 
@@ -547,6 +579,113 @@ with main_tabs[5]:
                     st.info("Aucune variable numérique comparable disponible pour le nouveau client.")
             except Exception as e:
                 st.error(f"Échec de la prédiction: {e}")
+
+# -------------------------------
+# Tab 7 — Seuil & coût métier
+# -------------------------------
+with main_tabs[6]:
+    st.subheader("Seuil & coût métier (optimisation)")
+    if model is None or X.empty or TARGET_COL is None:
+        st.info("Pour optimiser le seuil, il faut : un modèle chargé, des données et la colonne TARGET.")
+    else:
+        # Paramètres métier
+        cols = st.columns(4)
+        with cols[0]:
+            unit = st.selectbox("Unité monétaire", ["€", "CHF", "USD"], index=0)
+        with cols[1]:
+            cost_fp = st.number_input("Coût d'un FP (refus à tort)", min_value=0.0, value=100.0, step=10.0)
+        with cols[2]:
+            cost_fn = st.number_input("Coût d'un FN (acceptation risquée)", min_value=0.0, value=1000.0, step=10.0)
+        with cols[3]:
+            max_sample = st.number_input("Taille échantillon (max)", min_value=1000, value=20000, step=1000)
+
+        # Jeu de calcul (labeled)
+        labeled = pool_df.dropna(subset=[TARGET_COL]).copy()
+        if len(labeled) == 0:
+            st.warning("Aucune ligne labellisée trouvée (TARGET manquant).")
+        else:
+            # Aligner colonnes comme pour X
+            df_lab = labeled.set_index(ID_COL)
+            expected = list(X.columns)
+            for c in expected:
+                if c not in df_lab.columns:
+                    df_lab[c] = np.nan
+            X_all = df_lab[expected]
+            y_all = labeled[TARGET_COL].values.astype(int)
+
+            # Sampling pour tenir la perf
+            if len(X_all) > max_sample:
+                X_all = X_all.sample(int(max_sample), random_state=42)
+                y_all = y_all[X_all.index.get_indexer(X_all.index)]
+
+            # Probabilités
+            try:
+                p_all = model.predict_proba(X_all)[:, 1]
+            except Exception as e:
+                st.error(f"Impossible de scorer l'échantillon : {e}")
+                p_all = None
+
+            if p_all is not None:
+                # AUC
+                try:
+                    auc = roc_auc_score(y_all, p_all)
+                except Exception:
+                    auc = np.nan
+
+                # Courbes ROC / PR
+                fpr, tpr, roc_th = roc_curve(y_all, p_all)
+                prec, rec, pr_th = precision_recall_curve(y_all, p_all)
+
+                fig_roc = go.Figure()
+                fig_roc.add_trace(go.Scatter(x=fpr, y=tpr, mode="lines", name=f"ROC (AUC={auc:.3f})"))
+                fig_roc.add_trace(go.Scatter(x=[0,1], y=[0,1], mode="lines", name="Random", line=dict(dash="dash")))
+                fig_roc.update_layout(title="Courbe ROC", xaxis_title="FPR", yaxis_title="TPR", height=350)
+
+                fig_pr = go.Figure()
+                fig_pr.add_trace(go.Scatter(x=rec, y=prec, mode="lines", name="Precision-Recall"))
+                fig_pr.update_layout(title="Précision–Rappel", xaxis_title="Recall", yaxis_title="Precision", height=350)
+
+                st.plotly_chart(fig_roc, use_container_width=True)
+                st.plotly_chart(fig_pr, use_container_width=True)
+
+                # Courbe coût vs seuil
+                df_cost, best = cost_curve(y_all, p_all, cost_fp, cost_fn, step=0.001)
+                fig_cost = go.Figure()
+                fig_cost.add_trace(go.Scatter(x=df_cost["threshold"], y=df_cost["cost"], mode="lines", name="Coût total"))
+                fig_cost.add_vline(x=float(best["threshold"]), line_width=2, line_dash="dash", line_color="green",
+                                   annotation_text=f"Seuil optimal = {best['threshold']:.3f}",
+                                   annotation_position="top left")
+                fig_cost.add_vline(x=float(st.session_state["threshold"]), line_width=2, line_dash="dot", line_color="red",
+                                   annotation_text=f"Seuil courant = {st.session_state['threshold']:.3f}",
+                                   annotation_position="top right")
+                fig_cost.update_layout(title=f"Coût vs Seuil ({unit})", xaxis_title="Seuil", yaxis_title=f"Coût total ({unit})", height=350)
+                st.plotly_chart(fig_cost, use_container_width=True)
+
+                # Table métriques (seuil optimal et seuil courant)
+                cur = cost_at_threshold(y_all, p_all, float(st.session_state["threshold"]), cost_fp, cost_fn)
+                best_row = {
+                    "Seuil": f"{best['threshold']:.3f}",
+                    "Coût total": f"{best['cost']:.0f} {unit}",
+                    "TP": int(best["tp"]), "FP": int(best["fp"]), "FN": int(best["fn"]), "TN": int(best["tn"]),
+                    "Précision": f"{best['precision']:.3f}", "Rappel": f"{best['recall']:.3f}", "F1": f"{best['f1']:.3f}",
+                }
+                cur_row = {
+                    "Seuil": f"{st.session_state['threshold']:.3f}",
+                    "Coût total": f"{cur['cost']:.0f} {unit}",
+                    "TP": int(cur["tp"]), "FP": int(cur["fp"]), "FN": int(cur["fn"]), "TN": int(cur["tn"]),
+                    "Précision": f"{cur['precision']:.3f}", "Rappel": f"{cur['recall']:.3f}", "F1": f"{cur['f1']:.3f}",
+                }
+                st.markdown("**Synthèse**")
+                st.dataframe(pd.DataFrame([best_row, cur_row], index=["Seuil optimal", "Seuil courant"]))
+
+                c1, c2 = st.columns([1,2])
+                with c1:
+                    if st.button("✅ Appliquer le seuil optimal au dashboard"):
+                        st.session_state["threshold"] = float(best["threshold"])
+                        st.success(f"Seuil mis à jour à {best['threshold']:.3f}.")
+                        st.experimental_rerun()
+                with c2:
+                    st.caption("Le seuil optimal minimise le coût total attendu : `coût = FP × coût_FP + FN × coût_FN`.")
 
 # Footer
 st.divider()
