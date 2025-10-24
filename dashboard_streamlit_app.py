@@ -1,5 +1,5 @@
-# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v0.4.1)
-# ---------------------------------------------------------------
+# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v0.5.0)
+# ----------------------------------------------------------------
 # Run:  streamlit run dashboard_streamlit_app.py --server.address 0.0.0.0 --server.port 8501
 # One-file app (no folders required). Place artifacts at the repo root.
 #
@@ -10,7 +10,7 @@
 # - Global importance: global_importance.csv (optional)
 # - Interpretability: interpretability_summary.json (optional)
 
-APP_VERSION = "0.4.1"
+APP_VERSION = "0.5.0"
 
 import os
 import json
@@ -23,8 +23,6 @@ import plotly.graph_objects as go
 import streamlit as st
 from typing import List, Optional, Tuple
 
-from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline as SkPipeline
 from sklearn.compose import ColumnTransformer as SkColumnTransformer
 
@@ -90,7 +88,7 @@ def load_interpretability_summary(path: Optional[str]) -> dict:
             return json.load(f)
     return {}
 
-# Get raw expected input columns from a Pipeline/ColumnTransformer
+# Columns expected by the model's preprocessor (if any)
 
 def get_expected_input_columns(model) -> Optional[List[str]]:
     try:
@@ -105,92 +103,29 @@ def get_expected_input_columns(model) -> Optional[List[str]]:
         pass
     return None
 
-# Unwrap calibrated models to the base estimator if possible
-
-def unwrap_estimator(m):
-    base = m
-    try:
-        # Pipeline → take last step (estimator side)
-        if isinstance(base, SkPipeline):
-            base = base.steps[-1][1]
-        # CalibratedClassifierCV variants
-        for attr in ("base_estimator", "estimator", "calibrated_classifiers_"):
-            if hasattr(base, attr):
-                base = getattr(base, attr)
-                if isinstance(base, list) and len(base) > 0:
-                    inner = base[0]
-                    if hasattr(inner, "base_estimator"):
-                        base = inner.base_estimator
-                    elif hasattr(inner, "estimator"):
-                        base = inner.estimator
-                break
-    except Exception:
-        pass
-    return base
-
-# Local SHAP with two strategies:
-# 1) If we can isolate a tree-based estimator *after* preprocessing, use TreeExplainer on transformed inputs.
-# 2) Fallback: Kernel-based explainer on the full pipeline predict_proba (robust but slower).
+# Robust SHAP (model-agnostic) on the full pipeline predict_proba
 
 def compute_local_shap(estimator, X_background: pd.DataFrame, x_row: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-    import numpy as np
-    import pandas as pd
-    import shap
+    """
+    Explication locale robuste, modèle-agnostique, sur la pipeline complète.
+    Utilise shap.Explainer + masker indépendant sur la fonction predict_proba.
+    """
+    import shap, pandas as pd, numpy as np
 
-    # Try to locate a ColumnTransformer in a pipeline for transformation
-    ct = None
-    est = estimator
-    if isinstance(estimator, SkPipeline):
-        for name, step in estimator.steps:
-            if isinstance(step, SkColumnTransformer):
-                ct = step
-        # last estimator is at the end of the pipeline
-    base = unwrap_estimator(estimator)
+    # Limit background size to keep speed reasonable
+    bg = X_background
+    if len(bg) > 200:
+        bg = bg.sample(200, random_state=42)
 
-    # If we have a transformer, transform background and row to numeric space
-    Xbg = X_background
-    x1 = x_row
-    feat_names_out = None
-    try:
-        if ct is not None:
-            Xbg_t = ct.transform(Xbg)
-            x1_t = ct.transform(x1)
-            # feature names out if available (sklearn >=1.0)
-            try:
-                feat_names_out = ct.get_feature_names_out()
-            except Exception:
-                feat_names_out = None
-            # Try tree explainer on the base estimator with transformed inputs
-            try:
-                expl = shap.TreeExplainer(base)
-                sv = expl.shap_values(x1_t)
-                # CatBoost returns list for multiclass; binary returns array
-                vals = sv[1] if isinstance(sv, list) and len(sv) > 1 else sv
-                base_vals = expl.expected_value[1] if isinstance(expl.expected_value, (list, tuple, np.ndarray)) else expl.expected_value
-                return np.array(vals).reshape(-1), np.array([base_vals]).reshape(-1)
-            except Exception:
-                # fall back to kernel on transformed numeric inputs
-                def f_num(Xnp):
-                    return base.predict_proba(Xnp)[:, 1]
-                masker = shap.maskers.Independent(Xbg_t)
-                expl = shap.Explainer(f_num, masker)
-                ex = expl(x1_t)
-                return np.array(ex.values).reshape(-1), np.array(ex.base_values).reshape(-1)
-    except Exception:
-        pass
-
-    # Fallback: kernel on the full estimator with raw inputs (may be slower with categoricals)
-    def f_raw(Xdf):
+    def f(Xdf):
         if not isinstance(Xdf, pd.DataFrame):
-            Xdf = pd.DataFrame(Xdf, columns=list(X_background.columns))
+            Xdf = pd.DataFrame(Xdf, columns=list(bg.columns))
         return estimator.predict_proba(Xdf)[:, 1]
-    try:
-        masker = shap.maskers.Independent(X_background)
-        expl = shap.Explainer(f_raw, masker, feature_names=list(X_background.columns))
-        ex = expl(x_row)
-        return np.array(ex.values).reshape(-1), np.array(ex.base_values).reshape(-1)
-    except Exception as e:
-        raise RuntimeError(f"SHAP indisponible: {e}")
+
+    masker = shap.maskers.Independent(bg)
+    explainer = shap.Explainer(f, masker, feature_names=list(bg.columns))
+    ex = explainer(x_row)
+    return np.array(ex.values).reshape(-1), np.array(ex.base_values).reshape(-1)
 
 # -------------------------------
 # Locate artifacts at repo root (no folders required)
@@ -211,6 +146,7 @@ INTERP_SUM = _pick_first_existing(["interpretability_summary.json"])
 with st.sidebar:
     st.title("💳 Scoring Crédit — Dashboard")
     st.caption("Prêt à dépenser — transparence & explicabilité")
+    st.caption(f"App version: {APP_VERSION}")
     if not DATA_TRAIN:
         st.error("⚠️ Données non trouvées (placez `clients_demo.csv` ou `clients_demo.parquet` à la racine)")
 
@@ -236,13 +172,9 @@ interp_summary = load_interpretability_summary(INTERP_SUM)
 ID_COL = "SK_ID_CURR" if (not pool_df.empty and "SK_ID_CURR" in pool_df.columns) else (pool_df.columns[0] if not pool_df.empty else None)
 TARGET_COL = "TARGET" if (not pool_df.empty and "TARGET" in pool_df.columns) else None
 
-# Inferred types
-num_cols = [c for c in feature_names if c in pool_df.columns and pd.api.types.is_numeric_dtype(pool_df[c])]
-cat_cols = [c for c in feature_names if c in pool_df.columns and c not in num_cols]
-
 # Sidebar controls
 with st.sidebar:
-    st.subheader("Paramètres du modèle")
+    st.subheader("Paramètres du modèle (choix)")
     model_name = st.selectbox("Choisir le modèle", list(model_paths.keys()) if model_paths else ["—"])
     threshold = st.slider("Seuil d'acceptation (proba défaut)", 0.0, 0.5, 0.08, 0.005,
                           help="Au-delà du seuil = risque élevé ⇒ refus")
@@ -269,7 +201,7 @@ if not pool_df.empty and selected_id is not None:
             df_idx[c] = np.nan
     X = df_idx[temp_expected]
     x_row = X.loc[[selected_id]]
-    background = X.sample(min(500, len(X)), random_state=42)
+    background = X.sample(min(200, len(X)), random_state=42)
 else:
     X = pd.DataFrame(columns=feature_names)
     x_row = X.head(0)
@@ -322,7 +254,9 @@ with main_tabs[0]:
             st.markdown(f"Risque : **{band}**")
         with col2:
             st.markdown("**Contributions locales (SHAP)** — top 10")
-            if not background.empty and model is not None:
+            shap_enabled = st.toggle("Activer SHAP (expérimental)", value=False,
+                                     help="Active l'explication locale. Peut être lent selon le modèle.")
+            if shap_enabled and not background.empty and model is not None:
                 try:
                     vals, base_vals = compute_local_shap(model, background, x_row)
                     local_df = pd.DataFrame({
@@ -335,12 +269,13 @@ with main_tabs[0]:
                                   hover_data={"value": True, "abs_val": False},
                                   title="Impact sur le score (positif = ↑ risque)")
                     st.plotly_chart(bar, use_container_width=True)
-                except Exception:
-                    if global_imp_df is not None:
-                        st.info("SHAP indisponible pour ce modèle/format. Affichage des 10 variables les plus importantes (globales).")
-                        st.dataframe(global_imp_df.head(10))
-                    else:
-                        st.info("SHAP et importance globale indisponibles.")
+                except Exception as e:
+                    st.warning(f"SHAP indisponible: {e}")
+            else:
+                if global_imp_df is not None:
+                    st.dataframe(global_imp_df.head(10))
+                else:
+                    st.info("Importance globale indisponible.")
 
 # -------------------------------
 # Tab 2 — Client sheet
@@ -377,21 +312,26 @@ with main_tabs[2]:
             cohort_df = cohort_df[cohort_df[c] == pool_df.loc[pool_df[ID_COL] == selected_id, c].iloc[0]]
         st.caption(f"Taille de la cohorte similaire : **{len(cohort_df):,}**")
 
-        comp_feats = [f for f in (global_imp_df.head(8)["feature"].tolist() if global_imp_df is not None else list(X.columns)[:8]) if f in X.columns and pd.api.types.is_numeric_dtype(X[f])]
+        if global_imp_df is not None and not global_imp_df.empty:
+            cand = [f for f in global_imp_df["feature"].tolist() if f in X.columns and f in pool_df.columns]
+        else:
+            cand = [f for f in list(X.columns) if f in pool_df.columns]
+        comp_feats = [f for f in cand if pd.api.types.is_numeric_dtype(pool_df[f])][:8]
+
         if not comp_feats:
             st.info("Pas de variables numériques à comparer.")
         else:
             long_rows = []
             for f in comp_feats:
-                client_val = float(x_row[f].iloc[0]) if f in X.columns and pd.notnull(x_row[f].iloc[0]) else np.nan
-                # Use pool_df when the feature exists in the raw dataset; otherwise skip quantiles for that feature
-                if f in pool_df.columns and pd.api.types.is_numeric_dtype(pool_df[f]):
-                    pop_q = pool_df[f].quantile([0.1, 0.5, 0.9]).values
-                    coh_q = cohort_df[f].quantile([0.1, 0.5, 0.9]).values if len(cohort_df) > 1 else [np.nan, np.nan, np.nan]
-                    long_rows += [
-                        {"feature": f, "group": "Population", "p10": pop_q[0], "p50": pop_q[1], "p90": pop_q[2], "client": client_val},
-                        {"feature": f, "group": "Cohorte similaire", "p10": coh_q[0], "p50": coh_q[1], "p90": coh_q[2], "client": client_val},
-                    ]
+                if f not in pool_df.columns or not pd.api.types.is_numeric_dtype(pool_df[f]):
+                    continue
+                client_val = float(x_row[f].iloc[0]) if pd.notnull(x_row[f].iloc[0]) else np.nan
+                pop_q = pool_df[f].quantile([0.1, 0.5, 0.9]).values
+                coh_q = cohort_df[f].quantile([0.1, 0.5, 0.9]).values if len(cohort_df) > 1 else [np.nan, np.nan, np.nan]
+                long_rows += [
+                    {"feature": f, "group": "Population", "p10": pop_q[0], "p50": pop_q[1], "p90": pop_q[2], "client": client_val},
+                    {"feature": f, "group": "Cohorte similaire", "p10": coh_q[0], "p50": coh_q[1], "p90": coh_q[2], "client": client_val},
+                ]
             if not long_rows:
                 st.info("Aucune variable numérique comparable disponible dans le dataset brut.")
             else:
@@ -452,7 +392,7 @@ with main_tabs[5]:
         st.markdown("Chargez un **CSV** (1 ligne) ou saisissez quelques variables clés pour simuler un nouveau client.")
         up = st.file_uploader("Fichier CSV (1 ligne)", type=["csv"], accept_multiple_files=False)
         topk = st.slider("Nombre de variables clés à saisir (importance globale)", min_value=5, max_value=40, value=15, step=1)
-manual = st.checkbox("Saisie manuelle des variables clés", value=False)
+        manual = st.checkbox("Saisie manuelle des variables clés", value=False)
 
         new_x = None
         if up is not None:
@@ -504,7 +444,6 @@ manual = st.checkbox("Saisie manuelle des variables clés", value=False)
 
             if st.button("Simuler"):
                 new_x = pd.DataFrame([inputs])
-                new_x = pd.DataFrame([inputs])
 
         if new_x is not None:
             exp_cols = list(X.columns)
@@ -534,23 +473,29 @@ manual = st.checkbox("Saisie manuelle des variables clés", value=False)
                     }).sort_values("abs_val", ascending=False).head(10)
                     st.markdown("**Contributions locales (SHAP)** — top 10")
                     st.plotly_chart(px.bar(ld[::-1], x="shap_value", y="feature", orientation="h"), use_container_width=True)
-                except Exception:
-                    st.info("SHAP non disponible pour ce modèle/format.")
-                # quick comparison to population quantiles
-                comp_feats = [f for f in (global_imp_df.head(6)["feature"].tolist() if global_imp_df is not None else list(X.columns)[:6]) if f in X.columns and pd.api.types.is_numeric_dtype(X[f])]
+                except Exception as e:
+                    st.info(f"SHAP non disponible: {e}")
+                # quick comparison to population quantiles (use X to avoid missing raw columns)
+                if global_imp_df is not None and not global_imp_df.empty:
+                    comp_feats = [f for f in global_imp_df.head(6)["feature"].tolist() if f in X.columns and pd.api.types.is_numeric_dtype(X[f])]
+                else:
+                    comp_feats = [f for f in list(X.columns) if pd.api.types.is_numeric_dtype(X[f])][:6]
                 long_rows = []
                 for f in comp_feats:
                     client_val = float(new_x[f].iloc[0]) if pd.notnull(new_x[f].iloc[0]) else np.nan
                     pop_q = X[f].quantile([0.1, 0.5, 0.9]).values
                     long_rows.append({"feature": f, "group": "Population", "p10": pop_q[0], "p50": pop_q[1], "p90": pop_q[2], "client": client_val})
-                long_df = pd.DataFrame(long_rows)
-                figc = go.Figure()
-                figc.add_trace(go.Scatter(x=long_df["p10"], y=long_df["feature"], mode="markers", name="P10"))
-                figc.add_trace(go.Scatter(x=long_df["p50"], y=long_df["feature"], mode="markers", name="P50"))
-                figc.add_trace(go.Scatter(x=long_df["p90"], y=long_df["feature"], mode="markers", name="P90"))
-                figc.add_trace(go.Scatter(x=long_df["client"], y=long_df["feature"], mode="markers", name="Client", marker=dict(symbol="diamond", size=12)))
-                figc.update_layout(title="Positionnement du nouveau client (P10/P50/P90)", height=400)
-                st.plotly_chart(figc, use_container_width=True)
+                if long_rows:
+                    long_df = pd.DataFrame(long_rows)
+                    figc = go.Figure()
+                    figc.add_trace(go.Scatter(x=long_df["p10"], y=long_df["feature"], mode="markers", name="P10"))
+                    figc.add_trace(go.Scatter(x=long_df["p50"], y=long_df["feature"], mode="markers", name="P50"))
+                    figc.add_trace(go.Scatter(x=long_df["p90"], y=long_df["feature"], mode="markers", name="P90"))
+                    figc.add_trace(go.Scatter(x=long_df["client"], y=long_df["feature"], mode="markers", name="Client", marker=dict(symbol="diamond", size=12)))
+                    figc.update_layout(title="Positionnement du nouveau client (P10/P50/P90)", height=400)
+                    st.plotly_chart(figc, use_container_width=True)
+                else:
+                    st.info("Aucune variable numérique comparable disponible pour le nouveau client.")
             except Exception as e:
                 st.error(f"Échec de la prédiction: {e}")
 
