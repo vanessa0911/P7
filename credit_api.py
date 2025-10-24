@@ -1,68 +1,47 @@
-# credit_api.py — Prêt à dépenser - API de scoring (v0.9.0)
-# Lancement local:
-#   uvicorn credit_api:app --host 0.0.0.0 --port 8000 --reload
-#
-# Endpoints principaux:
-#   GET  /health           → {"status":"ok"}
-#   GET  /ready            → vérifie que le modèle est chargé
-#   GET  /metadata         → infos modèle/données
-#   GET  /features         → liste des features attendues par le modèle
-#   GET  /clients?limit=50 → quelques IDs disponibles (si dataset présent)
-#   POST /predict          → prédiction par client_id OU par "features" (dict)
-#
-# Remarques:
-# - Recherche automatiquement les artefacts à la racine:
-#     clients_demo.csv | clients_demo.parquet | application_train_clean.csv
-#     model_calibrated_isotonic.joblib | model_calibrated_sigmoid.joblib | model_baseline_logreg.joblib
-#     feature_names.npy (optionnel), global_importance.csv (optionnel)
-# - Alignement des colonnes (creation colonnes manquantes) comme dans le Streamlit
-
-APP_VERSION = "0.9.0-api"
+# credit_api.py — FastAPI pour scoring crédit + métriques de masse
+# Run: uvicorn credit_api:app --host 0.0.0.0 --port 8000 --reload
 
 import os
 import json
-import hashlib
-from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple
 
 import numpy as np
 import pandas as pd
 import joblib
 
-from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-# scikit
-from sklearn.pipeline import Pipeline as SkPipeline
-from sklearn.compose import ColumnTransformer as SkColumnTransformer
-
-# SHAP (optionnel)
-try:
-    import shap
-    SHAP_AVAILABLE = True
-except Exception:
-    SHAP_AVAILABLE = False
-
-
-# -------------------------------
-# Helpers
-# -------------------------------
+# ----------------- Utils chargement -----------------
 def _pick_first_existing(paths: List[str]) -> Optional[str]:
     for p in paths:
         if p and os.path.exists(p):
             return p
     return None
 
-def _load_table(path: str) -> pd.DataFrame:
+def load_table(path: str) -> pd.DataFrame:
     ext = os.path.splitext(path)[1].lower()
     if ext in [".parquet", ".pq"]:
         return pd.read_parquet(path)
     return pd.read_csv(path)
 
-def _load_model(path: str):
-    return joblib.load(path)
+def safe_load_model(path: str):
+    try:
+        return joblib.load(path)
+    except ModuleNotFoundError as e:
+        raise RuntimeError(f"Modèle nécessite le paquet manquant: {e.name}")
+    except Exception as e:
+        raise RuntimeError(f"Échec chargement modèle: {e}")
 
-def _get_expected_input_columns(model) -> Optional[List[str]]:
+def get_expected_input_columns(model) -> Optional[List[str]]:
+    # sklearn compatible
+    try:
+        from sklearn.pipeline import Pipeline as SkPipeline
+        from sklearn.compose import ColumnTransformer as SkColumnTransformer
+    except Exception:
+        SkPipeline = tuple()
+        SkColumnTransformer = tuple()
     try:
         m = model
         if isinstance(m, SkPipeline):
@@ -75,247 +54,197 @@ def _get_expected_input_columns(model) -> Optional[List[str]]:
         pass
     return None
 
-def _load_feature_names(path: Optional[str], df_cols: List[str]) -> List[str]:
-    if path and os.path.exists(path):
-        arr = np.load(path, allow_pickle=True)
-        names = list(arr.tolist())
-        return [c for c in names if c in df_cols]
-    return [c for c in df_cols if c not in {"TARGET", "SK_ID_CURR"}]
-
-def _compute_local_shap(model, background: pd.DataFrame, x_row: pd.DataFrame) -> Optional[pd.DataFrame]:
-    """
-    Retourne un DataFrame avec colonnes: feature, shap_value, abs_val, value
-    """
-    if not SHAP_AVAILABLE:
-        return None
-    bg = background
-    if len(bg) > 200:
-        bg = bg.sample(200, random_state=42)
-
-    def f(Xdf):
-        if not isinstance(Xdf, pd.DataFrame):
-            Xdf = pd.DataFrame(Xdf, columns=list(bg.columns))
-        return model.predict_proba(Xdf)[:, 1]
-
-    masker = shap.maskers.Independent(bg)
-    explainer = shap.Explainer(f, masker, feature_names=list(bg.columns))
-    ex = explainer(x_row)
-    vals = np.array(ex.values).reshape(-1)
-    df = pd.DataFrame({
-        "feature": list(x_row.columns),
-        "shap_value": vals,
-        "abs_val": np.abs(vals),
-        "value": x_row.iloc[0].values,
-    }).sort_values("abs_val", ascending=False)
-    return df
-
-def _sha_file(path: str) -> str:
-    try:
-        with open(path, "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()[:8]
-    except Exception:
-        return "n/a"
-
-
-# -------------------------------
-# Localisation des artefacts (racine)
-# -------------------------------
+# ----------------- Fichiers à la racine -----------------
 DATA_TRAIN = _pick_first_existing([
+    "application_train_clean.csv",
     "clients_demo.csv",
     "clients_demo.parquet",
-    "application_train_clean.csv",
 ])
 MODEL_ISO  = _pick_first_existing(["model_calibrated_isotonic.joblib"])
 MODEL_SIG  = _pick_first_existing(["model_calibrated_sigmoid.joblib"])
 MODEL_BASE = _pick_first_existing(["model_baseline_logreg.joblib"])
-FEATS_PATH = _pick_first_existing(["feature_names.npy"])
 GLOBIMP    = _pick_first_existing(["global_importance.csv"])
 
-# -------------------------------
-# Chargement des données & modèle
-# -------------------------------
-pool_df = _load_table(DATA_TRAIN) if DATA_TRAIN else pd.DataFrame()
-ID_COL = "SK_ID_CURR" if (not pool_df.empty and "SK_ID_CURR" in pool_df.columns) else (pool_df.columns[0] if not pool_df.empty else None)
+# ----------------- Chargement artefacts -----------------
+if not DATA_TRAIN:
+    raise RuntimeError("Données non trouvées (placez clients_demo.csv ou .parquet à la racine).")
 
-feature_names = _load_feature_names(FEATS_PATH, list(pool_df.columns)) if not pool_df.empty else []
+pool_df = load_table(DATA_TRAIN)
+ID_COL = "SK_ID_CURR" if "SK_ID_CURR" in pool_df.columns else pool_df.columns[0]
+TARGET_COL = "TARGET" if "TARGET" in pool_df.columns else None
 
+# modèle : priorité isotonic > sigmoid > baseline
 model_path = MODEL_ISO or MODEL_SIG or MODEL_BASE
 if not model_path:
-    raise RuntimeError("Aucun fichier modèle trouvé à la racine. Ajoutez un .joblib (isotonic/sigmoid/baseline).")
+    raise RuntimeError("Aucun modèle joblib trouvé à la racine.")
+model = safe_load_model(model_path)
 
-try:
-    model = _load_model(model_path)
-except ModuleNotFoundError as e:
-    raise RuntimeError(f"Le modèle nécessite un paquet manquant: {e.name}. Installez-le dans l'environnement.")
-except Exception as e:
-    raise RuntimeError(f"Échec du chargement du modèle `{model_path}`: {e}")
+# alignement colonnes d'entrée
+df_idx = pool_df.set_index(ID_COL)
+expected_cols = get_expected_input_columns(model) or [c for c in df_idx.columns if c not in {"TARGET"}]
+for c in expected_cols:
+    if c not in df_idx.columns:
+        df_idx[c] = np.nan
+X_all = df_idx[expected_cols]
 
-expected_cols = _get_expected_input_columns(model)
-if expected_cols is None:
-    # fallback: utiliser feature_names ou colonnes du dataset
-    if feature_names:
-        expected_cols = feature_names
-    elif not pool_df.empty:
-        expected_cols = [c for c in pool_df.columns if c not in {ID_COL, "TARGET"}]
-    else:
-        expected_cols = []
+# background SHAP
+_bg = X_all.sample(min(200, len(X_all)), random_state=42)
 
-# -------------------------------
-# Préparation SHAP: background
-# -------------------------------
-if not pool_df.empty and expected_cols:
-    df_idx = pool_df.set_index(ID_COL) if ID_COL else pool_df
-    # Ajoute colonnes manquantes
-    for c in expected_cols:
-        if c not in df_idx.columns:
-            df_idx[c] = np.nan
-    BACKGROUND = df_idx[expected_cols]
-    BACKGROUND_SAMPLE = BACKGROUND.sample(min(200, len(BACKGROUND)), random_state=42) if len(BACKGROUND) > 0 else BACKGROUND
-else:
-    BACKGROUND = pd.DataFrame(columns=expected_cols)
-    BACKGROUND_SAMPLE = BACKGROUND
-
-# -------------------------------
-# Pydantic models
-# -------------------------------
-class PredictRequest(BaseModel):
-    client_id: str | int | None = Field(default=None, description="ID client présent dans le dataset (optionnel)")
-    features: Dict[str, Any] | None = Field(default=None, description="Dictionnaire feature→valeur pour scorer un nouveau client")
-    threshold: float | None = Field(default=0.08, description="Seuil décisionnel (proba défaut)")
-    shap: bool = Field(default=False, description="Retourner aussi les contributions locales (topK)")
-    topk: int = Field(default=10, description="Nombre de variables pour le top SHAP")
-
-class PredictResponse(BaseModel):
-    client_id: str | None = None
-    proba_default: float
-    decision: str
-    threshold_used: float
-    warnings: List[str] = []
-    top_contrib: List[Dict[str, Any]] | None = None  # si shap=True
-
-# -------------------------------
-# FastAPI app
-# -------------------------------
-app = FastAPI(
-    title="Prêt à dépenser — API de scoring",
-    version=APP_VERSION,
-    description="API FastAPI pour prédire la probabilité de défaut et expliquer la décision."
+# ----------------- Métriques & coût -----------------
+from sklearn.metrics import (
+    precision_recall_curve, roc_curve, roc_auc_score, confusion_matrix,
+    precision_score, recall_score, f1_score
 )
+
+def cost_at_threshold(y_true: np.ndarray, p: np.ndarray, t: float, cost_fp: float, cost_fn: float):
+    y_pred = (p >= t).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0,1]).ravel()
+    cost = fp * cost_fp + fn * cost_fn
+    prec = precision_score(y_true, y_pred, zero_division=0)
+    rec  = recall_score(y_true, y_pred, zero_division=0)
+    f1   = f1_score(y_true, y_pred, zero_division=0)
+    return dict(cost=float(cost), tn=int(tn), fp=int(fp), fn=int(fn), tp=int(tp),
+                precision=float(prec), recall=float(rec), f1=float(f1))
+
+def cost_curve(y_true: np.ndarray, p: np.ndarray, cost_fp: float, cost_fn: float, step: float=0.001):
+    step = float(step)
+    if step <= 0:
+        step = 0.001
+    ts = np.arange(0.0, 1.0 + step, step, dtype=float)
+    rows = []
+    for t in ts:
+        m = cost_at_threshold(y_true, p, float(t), cost_fp, cost_fn)
+        m["threshold"] = float(t)
+        rows.append(m)
+    df = pd.DataFrame(rows)
+    best_pos = int(np.argmin(pd.to_numeric(df["cost"], errors="coerce").to_numpy()))
+    best = df.iloc[best_pos].to_dict()
+    return df, best
+
+# ----------------- FastAPI app -----------------
+app = FastAPI(title="Credit Scoring API", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
+)
+
+class PredictBody(BaseModel):
+    client_id: Optional[int | str] = None
+    features: Optional[Dict[str, Any]] = None
+    threshold: Optional[float] = 0.08
+    shap: Optional[bool] = True
+    topk: Optional[int] = 10
+
+class MetricsBody(BaseModel):
+    cost_fp: float = 100.0
+    cost_fn: float = 1000.0
+    max_sample: int = 20000
+    step: float = 0.001
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": APP_VERSION}
+    return {"status": "ok", "model": os.path.basename(model_path), "rows": int(len(X_all))}
 
-@app.get("/ready")
-def ready():
-    ok = model is not None and isinstance(expected_cols, list)
-    return {"ready": bool(ok), "n_features_expected": len(expected_cols)}
-
-@app.get("/metadata")
-def metadata():
-    data = {
-        "app_version": APP_VERSION,
-        "model_path": model_path,
-        "model_sha": _sha_file(model_path),
-        "data_path": DATA_TRAIN,
-        "data_sha": _sha_file(DATA_TRAIN) if DATA_TRAIN else None,
-        "n_rows_data": len(pool_df) if not pool_df.empty else 0,
-        "id_column": ID_COL,
-        "n_expected_features": len(expected_cols),
-        "shap_available": SHAP_AVAILABLE,
-        "now": datetime.utcnow().isoformat(),
-    }
-    return data
-
-@app.get("/features")
-def features():
-    return {"features": expected_cols}
-
-@app.get("/clients")
-def clients(limit: int = Query(50, ge=1, le=500)):
-    if pool_df.empty or ID_COL is None:
-        return {"clients": []}
-    return {"clients": pool_df[ID_COL].head(limit).astype(str).tolist()}
-
-def _align_one_row(df_like: pd.DataFrame) -> pd.DataFrame:
-    """
-    Reçoit un DataFrame (1 ligne), ajoute colonnes manquantes et réordonne selon expected_cols
-    """
-    out = df_like.copy()
-    for c in expected_cols:
-        if c not in out.columns:
-            out[c] = np.nan
-    out = out[expected_cols]
-    return out
-
-@app.post("/predict", response_model=PredictResponse)
-def predict(req: PredictRequest):
-    warnings: List[str] = []
-    x_row: pd.DataFrame | None = None
-    client_id_str: str | None = None
-
-    # 1) Client existant via client_id
-    if req.client_id is not None:
-        if pool_df.empty or ID_COL is None:
-            raise HTTPException(status_code=400, detail="Dataset indisponible pour chercher un client_id.")
-        mask = pool_df[ID_COL].astype(str) == str(req.client_id)
-        if not mask.any():
-            raise HTTPException(status_code=404, detail=f"Client_id {req.client_id} introuvable.")
-        row_raw = pool_df.loc[mask].iloc[[0]]  # DataFrame (1 ligne)
-        row_raw = row_raw.drop(columns=[c for c in [ID_COL, "TARGET"] if c in row_raw.columns], errors="ignore")
-        x_row = _align_one_row(row_raw)
-        client_id_str = str(req.client_id)
-
-    # 2) Nouveau client via features
-    if req.features is not None:
-        # Si BOTH sont fournis: on privilégie features en avertissant
-        if client_id_str is not None:
-            warnings.append("client_id fourni mais ignoré car 'features' est également fourni.")
-        feat_df = pd.DataFrame([req.features])
-        x_row = _align_one_row(feat_df)
-        client_id_str = None
-
-    if x_row is None:
-        raise HTTPException(status_code=400, detail="Fournir soit 'client_id', soit 'features' (dict).")
-
-    # Prédiction
+@app.post("/predict")
+def predict(body: PredictBody):
+    # construire la ligne
+    if body.client_id is not None:
+        cid = body.client_id
+        if cid not in X_all.index:
+            raise HTTPException(status_code=404, detail=f"client_id {cid} introuvable")
+        x_row = X_all.loc[[cid]]
+    elif body.features is not None:
+        row = {}
+        for c in expected_cols:
+            v = body.features.get(c, None)
+            row[c] = np.nan if v is None else v
+        x_row = pd.DataFrame([row], columns=expected_cols)
+    else:
+        raise HTTPException(status_code=400, detail="Fournir client_id ou features")
+    # proba
     try:
         proba = float(model.predict_proba(x_row)[0, 1])
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Impossible de scorer: {e}")
-
-    # Décision
-    thr = 0.08 if req.threshold is None else float(req.threshold)
-    decision = "refus" if proba >= thr else "accord"
+        raise HTTPException(status_code=500, detail=f"Erreur prédiction: {e}")
 
     # SHAP (optionnel)
-    top_contrib = None
-    if req.shap:
-        if not SHAP_AVAILABLE:
-            warnings.append("SHAP indisponible: module non installé.")
-        else:
-            # background = BACKGROUND_SAMPLE si dispo, sinon x_row même
-            bg = BACKGROUND_SAMPLE if BACKGROUND_SAMPLE is not None and len(BACKGROUND_SAMPLE) > 0 else x_row
-            try:
-                df_shap = _compute_local_shap(model, bg, x_row)
-                if df_shap is not None and not df_shap.empty:
-                    df_top = df_shap.head(int(req.topk))
-                    top_contrib = [
-                        {
-                            "feature": str(r["feature"]),
-                            "value": None if pd.isna(r["value"]) else (float(r["value"]) if isinstance(r["value"], (int, float, np.floating)) else str(r["value"])),
-                            "shap_value": float(r["shap_value"]),
-                        }
-                        for _, r in df_top.iterrows()
-                    ]
-            except Exception as e:
-                warnings.append(f"SHAP en échec: {e}")
+    top_contrib = []
+    if body.shap:
+        try:
+            import shap
+            bg = _bg
+            def f(Xdf):
+                if not isinstance(Xdf, pd.DataFrame):
+                    Xdf = pd.DataFrame(Xdf, columns=list(bg.columns))
+                return model.predict_proba(Xdf)[:, 1]
+            masker = shap.maskers.Independent(bg)
+            explainer = shap.Explainer(f, masker, feature_names=list(bg.columns))
+            ex = explainer(x_row)
+            vals = np.array(ex.values).reshape(-1)
+            abs_vals = np.abs(vals)
+            order = np.argsort(-abs_vals)[: int(body.topk or 10)]
+            for idx in order:
+                feat = bg.columns[idx]
+                top_contrib.append({
+                    "feature": str(feat),
+                    "shap_value": float(vals[idx]),
+                    "value": (None if pd.isna(x_row.iloc[0, idx]) else x_row.iloc[0, idx]),
+                })
+        except Exception:
+            top_contrib = []
 
-    return PredictResponse(
-        client_id=client_id_str,
-        proba_default=proba,
-        decision=decision,
-        threshold_used=thr,
-        warnings=warnings,
-        top_contrib=top_contrib
-    )
+    return {"proba_default": proba, "threshold": body.threshold, "top_contrib": top_contrib}
+
+@app.post("/metrics")
+def metrics(body: MetricsBody):
+    if TARGET_COL is None or TARGET_COL not in pool_df.columns:
+        raise HTTPException(status_code=400, detail="TARGET manquant dans les données serveur.")
+    df_lab = pool_df.dropna(subset=[TARGET_COL]).copy()
+    if df_lab.empty:
+        raise HTTPException(status_code=400, detail="Aucune ligne labellisée.")
+    df_lab = df_lab.set_index(ID_COL)
+    for c in expected_cols:
+        if c not in df_lab.columns:
+            df_lab[c] = np.nan
+    X = df_lab[expected_cols]
+    y = df_lab[TARGET_COL].astype(int)
+
+    if len(X) > int(body.max_sample):
+        X = X.sample(int(body.max_sample), random_state=42)
+        y = y.loc[X.index]
+
+    try:
+        p = model.predict_proba(X)[:, 1]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur scoring masse: {e}")
+
+    # AUC, ROC, PR
+    try:
+        auc = float(roc_auc_score(y.values, p))
+    except Exception:
+        auc = float("nan")
+    try:
+        fpr, tpr, roc_th = roc_curve(y.values, p)
+        fpr, tpr = fpr.tolist(), tpr.tolist()
+    except Exception:
+        fpr, tpr = [], []
+    try:
+        prec, rec, pr_th = precision_recall_curve(y.values, p)
+        prec, rec = prec.tolist(), rec.tolist()
+    except Exception:
+        prec, rec = [], []
+
+    # Coût
+    df_cost, best = cost_curve(y.values, p, float(body.cost_fp), float(body.cost_fn), float(body.step))
+    return {
+        "auc": auc,
+        "roc": {"fpr": fpr, "tpr": tpr},
+        "pr": {"precision": prec, "recall": rec},
+        "cost_curve": {
+            "threshold": df_cost["threshold"].astype(float).tolist(),
+            "cost": df_cost["cost"].astype(float).tolist(),
+            "best": {k: (float(v) if isinstance(v, (int, float, np.floating)) else v) for k, v in best.items()},
+        },
+        "n_scored": int(len(X)),
+    }
