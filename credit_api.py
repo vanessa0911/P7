@@ -1,9 +1,8 @@
-# credit_api.py — FastAPI pour scoring crédit + métriques de masse
-# Run: uvicorn credit_api:app --host 0.0.0.0 --port 8000 --reload
+# credit_api.py — FastAPI pour scoring crédit + métriques de masse (v1.0.1)
+# Run local: uvicorn credit_api:app --host 0.0.0.0 --port 8000 --reload
 
 import os
-import json
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List
 
 import numpy as np
 import pandas as pd
@@ -11,6 +10,7 @@ import joblib
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse, JSONResponse
 from pydantic import BaseModel
 
 # ----------------- Utils chargement -----------------
@@ -35,7 +35,6 @@ def safe_load_model(path: str):
         raise RuntimeError(f"Échec chargement modèle: {e}")
 
 def get_expected_input_columns(model) -> Optional[List[str]]:
-    # sklearn compatible
     try:
         from sklearn.pipeline import Pipeline as SkPipeline
         from sklearn.compose import ColumnTransformer as SkColumnTransformer
@@ -63,9 +62,7 @@ DATA_TRAIN = _pick_first_existing([
 MODEL_ISO  = _pick_first_existing(["model_calibrated_isotonic.joblib"])
 MODEL_SIG  = _pick_first_existing(["model_calibrated_sigmoid.joblib"])
 MODEL_BASE = _pick_first_existing(["model_baseline_logreg.joblib"])
-GLOBIMP    = _pick_first_existing(["global_importance.csv"])
 
-# ----------------- Chargement artefacts -----------------
 if not DATA_TRAIN:
     raise RuntimeError("Données non trouvées (placez clients_demo.csv ou .parquet à la racine).")
 
@@ -73,13 +70,11 @@ pool_df = load_table(DATA_TRAIN)
 ID_COL = "SK_ID_CURR" if "SK_ID_CURR" in pool_df.columns else pool_df.columns[0]
 TARGET_COL = "TARGET" if "TARGET" in pool_df.columns else None
 
-# modèle : priorité isotonic > sigmoid > baseline
 model_path = MODEL_ISO or MODEL_SIG or MODEL_BASE
 if not model_path:
     raise RuntimeError("Aucun modèle joblib trouvé à la racine.")
 model = safe_load_model(model_path)
 
-# alignement colonnes d'entrée
 df_idx = pool_df.set_index(ID_COL)
 expected_cols = get_expected_input_columns(model) or [c for c in df_idx.columns if c not in {"TARGET"}]
 for c in expected_cols:
@@ -87,7 +82,6 @@ for c in expected_cols:
         df_idx[c] = np.nan
 X_all = df_idx[expected_cols]
 
-# background SHAP
 _bg = X_all.sample(min(200, len(X_all)), random_state=42)
 
 # ----------------- Métriques & coût -----------------
@@ -122,12 +116,17 @@ def cost_curve(y_true: np.ndarray, p: np.ndarray, cost_fp: float, cost_fn: float
     return df, best
 
 # ----------------- FastAPI app -----------------
-app = FastAPI(title="Credit Scoring API", version="1.0.0")
+app = FastAPI(title="Credit Scoring API", version="1.0.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
+
+# ➜ Route racine: redirige vers /docs (évite {"detail":"Not Found"})
+@app.get("/", include_in_schema=False)
+def root():
+    return RedirectResponse(url="/docs")
 
 class PredictBody(BaseModel):
     client_id: Optional[int | str] = None
@@ -146,6 +145,19 @@ class MetricsBody(BaseModel):
 def health():
     return {"status": "ok", "model": os.path.basename(model_path), "rows": int(len(X_all))}
 
+# Petit helper pour récupérer quelques IDs de test
+@app.get("/sample_ids")
+def sample_ids(n: int = 5):
+    ids = X_all.index[: max(1, min(int(n), len(X_all)))].tolist()
+    # cast en int si possible
+    clean = []
+    for v in ids:
+        try:
+            clean.append(int(v))
+        except Exception:
+            clean.append(v)
+    return {"ids": clean}
+
 @app.post("/predict")
 def predict(body: PredictBody):
     # construire la ligne
@@ -161,7 +173,8 @@ def predict(body: PredictBody):
             row[c] = np.nan if v is None else v
         x_row = pd.DataFrame([row], columns=expected_cols)
     else:
-        raise HTTPException(status_code=400, detail="Fournir client_id ou features")
+        raise HTTPException(status_code=400, detail="Fournir client_id OU features")
+
     # proba
     try:
         proba = float(model.predict_proba(x_row)[0, 1])
@@ -225,17 +238,17 @@ def metrics(body: MetricsBody):
     except Exception:
         auc = float("nan")
     try:
-        fpr, tpr, roc_th = roc_curve(y.values, p)
+        fpr, tpr, _ = roc_curve(y.values, p)
         fpr, tpr = fpr.tolist(), tpr.tolist()
     except Exception:
         fpr, tpr = [], []
     try:
-        prec, rec, pr_th = precision_recall_curve(y.values, p)
+        prec, rec, _ = precision_recall_curve(y.values, p)
         prec, rec = prec.tolist(), rec.tolist()
     except Exception:
         prec, rec = [], []
 
-    # Coût
+    # Courbe de coût
     df_cost, best = cost_curve(y.values, p, float(body.cost_fp), float(body.cost_fn), float(body.step))
     return {
         "auc": auc,
