@@ -105,16 +105,92 @@ def get_expected_input_columns(model) -> Optional[List[str]]:
         pass
     return None
 
-# Model-agnostic SHAP using the full estimator as a black box (works with Pipelines/Calibrated)
+# Unwrap calibrated models to the base estimator if possible
+
+def unwrap_estimator(m):
+    base = m
+    try:
+        # Pipeline → take last step (estimator side)
+        if isinstance(base, SkPipeline):
+            base = base.steps[-1][1]
+        # CalibratedClassifierCV variants
+        for attr in ("base_estimator", "estimator", "calibrated_classifiers_"):
+            if hasattr(base, attr):
+                base = getattr(base, attr)
+                if isinstance(base, list) and len(base) > 0:
+                    inner = base[0]
+                    if hasattr(inner, "base_estimator"):
+                        base = inner.base_estimator
+                    elif hasattr(inner, "estimator"):
+                        base = inner.estimator
+                break
+    except Exception:
+        pass
+    return base
+
+# Local SHAP with two strategies:
+# 1) If we can isolate a tree-based estimator *after* preprocessing, use TreeExplainer on transformed inputs.
+# 2) Fallback: Kernel-based explainer on the full pipeline predict_proba (robust but slower).
 
 def compute_local_shap(estimator, X_background: pd.DataFrame, x_row: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-    def f(Xdf):
+    import numpy as np
+    import pandas as pd
+    import shap
+
+    # Try to locate a ColumnTransformer in a pipeline for transformation
+    ct = None
+    est = estimator
+    if isinstance(estimator, SkPipeline):
+        for name, step in estimator.steps:
+            if isinstance(step, SkColumnTransformer):
+                ct = step
+        # last estimator is at the end of the pipeline
+    base = unwrap_estimator(estimator)
+
+    # If we have a transformer, transform background and row to numeric space
+    Xbg = X_background
+    x1 = x_row
+    feat_names_out = None
+    try:
+        if ct is not None:
+            Xbg_t = ct.transform(Xbg)
+            x1_t = ct.transform(x1)
+            # feature names out if available (sklearn >=1.0)
+            try:
+                feat_names_out = ct.get_feature_names_out()
+            except Exception:
+                feat_names_out = None
+            # Try tree explainer on the base estimator with transformed inputs
+            try:
+                expl = shap.TreeExplainer(base)
+                sv = expl.shap_values(x1_t)
+                # CatBoost returns list for multiclass; binary returns array
+                vals = sv[1] if isinstance(sv, list) and len(sv) > 1 else sv
+                base_vals = expl.expected_value[1] if isinstance(expl.expected_value, (list, tuple, np.ndarray)) else expl.expected_value
+                return np.array(vals).reshape(-1), np.array([base_vals]).reshape(-1)
+            except Exception:
+                # fall back to kernel on transformed numeric inputs
+                def f_num(Xnp):
+                    return base.predict_proba(Xnp)[:, 1]
+                masker = shap.maskers.Independent(Xbg_t)
+                expl = shap.Explainer(f_num, masker)
+                ex = expl(x1_t)
+                return np.array(ex.values).reshape(-1), np.array(ex.base_values).reshape(-1)
+    except Exception:
+        pass
+
+    # Fallback: kernel on the full estimator with raw inputs (may be slower with categoricals)
+    def f_raw(Xdf):
         if not isinstance(Xdf, pd.DataFrame):
             Xdf = pd.DataFrame(Xdf, columns=list(X_background.columns))
         return estimator.predict_proba(Xdf)[:, 1]
-    explainer = shap.Explainer(f, X_background, feature_names=list(X_background.columns))
-    values = explainer(x_row)
-    return np.array(values.values).reshape(-1), np.array(values.base_values).reshape(-1)
+    try:
+        masker = shap.maskers.Independent(X_background)
+        expl = shap.Explainer(f_raw, masker, feature_names=list(X_background.columns))
+        ex = expl(x_row)
+        return np.array(ex.values).reshape(-1), np.array(ex.base_values).reshape(-1)
+    except Exception as e:
+        raise RuntimeError(f"SHAP indisponible: {e}")
 
 # -------------------------------
 # Locate artifacts at repo root (no folders required)
@@ -307,23 +383,28 @@ with main_tabs[2]:
         else:
             long_rows = []
             for f in comp_feats:
-                client_val = float(x_row[f].iloc[0]) if pd.notnull(x_row[f].iloc[0]) else np.nan
-                pop_q = pool_df[f].quantile([0.1, 0.5, 0.9]).values
-                coh_q = cohort_df[f].quantile([0.1, 0.5, 0.9]).values if len(cohort_df) > 1 else [np.nan, np.nan, np.nan]
-                long_rows += [
-                    {"feature": f, "group": "Population", "p10": pop_q[0], "p50": pop_q[1], "p90": pop_q[2], "client": client_val},
-                    {"feature": f, "group": "Cohorte similaire", "p10": coh_q[0], "p50": coh_q[1], "p90": coh_q[2], "client": client_val},
-                ]
-            long_df = pd.DataFrame(long_rows)
-            for grp in ["Population", "Cohorte similaire"]:
-                sub = long_df[long_df.group == grp]
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=sub["p10"], y=sub["feature"], mode="markers", name="P10"))
-                fig.add_trace(go.Scatter(x=sub["p50"], y=sub["feature"], mode="markers", name="P50"))
-                fig.add_trace(go.Scatter(x=sub["p90"], y=sub["feature"], mode="markers", name="P90"))
-                fig.add_trace(go.Scatter(x=sub["client"], y=sub["feature"], mode="markers", name="Client", marker=dict(symbol="diamond", size=12)))
-                fig.update_layout(title=f"{grp} — Positionnement du client (P10/P50/P90)", height=400)
-                st.plotly_chart(fig, use_container_width=True)
+                client_val = float(x_row[f].iloc[0]) if f in X.columns and pd.notnull(x_row[f].iloc[0]) else np.nan
+                # Use pool_df when the feature exists in the raw dataset; otherwise skip quantiles for that feature
+                if f in pool_df.columns and pd.api.types.is_numeric_dtype(pool_df[f]):
+                    pop_q = pool_df[f].quantile([0.1, 0.5, 0.9]).values
+                    coh_q = cohort_df[f].quantile([0.1, 0.5, 0.9]).values if len(cohort_df) > 1 else [np.nan, np.nan, np.nan]
+                    long_rows += [
+                        {"feature": f, "group": "Population", "p10": pop_q[0], "p50": pop_q[1], "p90": pop_q[2], "client": client_val},
+                        {"feature": f, "group": "Cohorte similaire", "p10": coh_q[0], "p50": coh_q[1], "p90": coh_q[2], "client": client_val},
+                    ]
+            if not long_rows:
+                st.info("Aucune variable numérique comparable disponible dans le dataset brut.")
+            else:
+                long_df = pd.DataFrame(long_rows)
+                for grp in ["Population", "Cohorte similaire"]:
+                    sub = long_df[long_df.group == grp]
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(x=sub["p10"], y=sub["feature"], mode="markers", name="P10"))
+                    fig.add_trace(go.Scatter(x=sub["p50"], y=sub["feature"], mode="markers", name="P50"))
+                    fig.add_trace(go.Scatter(x=sub["p90"], y=sub["feature"], mode="markers", name="P90"))
+                    fig.add_trace(go.Scatter(x=sub["client"], y=sub["feature"], mode="markers", name="Client", marker=dict(symbol="diamond", size=12)))
+                    fig.update_layout(title=f"{grp} — Positionnement du client (P10/P50/P90)", height=400)
+                    st.plotly_chart(fig, use_container_width=True)
 
 # -------------------------------
 # Tab 4 — Global insights
@@ -370,7 +451,8 @@ with main_tabs[5]:
     else:
         st.markdown("Chargez un **CSV** (1 ligne) ou saisissez quelques variables clés pour simuler un nouveau client.")
         up = st.file_uploader("Fichier CSV (1 ligne)", type=["csv"], accept_multiple_files=False)
-        manual = st.checkbox("Saisie manuelle simplifiée", value=False)
+        topk = st.slider("Nombre de variables clés à saisir (importance globale)", min_value=5, max_value=40, value=15, step=1)
+manual = st.checkbox("Saisie manuelle des variables clés", value=False)
 
         new_x = None
         if up is not None:
@@ -384,23 +466,44 @@ with main_tabs[5]:
                 st.error(f"Impossible de lire le CSV : {e}")
 
         if manual and new_x is None:
-            if global_imp_df is not None:
-                cand = [f for f in global_imp_df["feature"].tolist() if f in X.columns]
+            # Variables clés = topK par importance globale si dispo, sinon premières colonnes
+            if global_imp_df is not None and not global_imp_df.empty:
+                keys = [f for f in global_imp_df["feature"].tolist() if f in X.columns][:topk]
             else:
-                cand = list(X.columns)
-            num_cand = [f for f in cand if pd.api.types.is_numeric_dtype(X[f])][:10]
-            cat_cand = [f for f in cand if f not in num_cand][:5]
+                keys = list(X.columns)[:topk]
+            # Séparer numériques / catégorielles parmi ces clés
+            num_cand = [f for f in keys if pd.api.types.is_numeric_dtype(X[f])]
+            cat_cand = [f for f in keys if f not in num_cand]
+
+            st.markdown("**Saisie manuelle** — valeurs par défaut = médiane (num) / modalité la plus fréquente (cat)")
             cols = st.columns(2)
             inputs = {}
             with cols[0]:
                 for f in num_cand:
-                    default = float(np.nanmedian(X[f].values)) if np.isfinite(np.nanmedian(X[f].values)) else 0.0
+                    series = X[f]
+                    default = float(np.nanmedian(series.values)) if np.isfinite(np.nanmedian(series.values)) else 0.0
                     inputs[f] = st.number_input(f, value=float(default))
             with cols[1]:
                 for f in cat_cand:
-                    opts = sorted([str(x) for x in pd.Series(X[f].dropna().unique()).astype(str).tolist()][:50]) or ["NA"]
-                    inputs[f] = st.selectbox(f, options=opts)
+                    series = pd.Series(X[f].dropna().astype(str))
+                    mode = series.mode().iloc[0] if not series.empty else "NA"
+                    opts = sorted(series.unique().tolist()[:50]) or ["NA"]
+                    inputs[f] = st.selectbox(f, options=opts, index=(opts.index(mode) if mode in opts else 0))
+
+            # Option: pré-remplir depuis le client sélectionné
+            with st.expander("Pré-remplir depuis le client sélectionné"):
+                if not x_row.empty:
+                    if st.button("Copier les valeurs du client sélectionné"):
+                        for f in keys:
+                            val = x_row.iloc[0][f] if f in x_row.columns else np.nan
+                            if f in num_cand and pd.notnull(val):
+                                inputs[f] = float(val)
+                            elif f in cat_cand and pd.notnull(val):
+                                inputs[f] = str(val)
+                        st.experimental_rerun()
+
             if st.button("Simuler"):
+                new_x = pd.DataFrame([inputs])
                 new_x = pd.DataFrame([inputs])
 
         if new_x is not None:
