@@ -56,6 +56,17 @@ def load_table(path: str) -> pd.DataFrame:
 def load_model(path: str):
     return joblib.load(path)
 
+# Safe loader with helpful error if a dependency is missing (e.g. catboost)
+def safe_load_model(path: str):
+    try:
+        return load_model(path)
+    except ModuleNotFoundError as e:
+        st.error(f"Le modèle nécessite le paquet manquant: {e.name}. Installez-le avec `pip install {e.name}` puis relancez l'app.")
+        raise
+    except Exception as e:
+        st.error("Échec du chargement du modèle. Détail dans les logs Streamlit.")
+        raise
+
 @st.cache_data(show_spinner=False)
 def load_feature_names(path: Optional[str], df_cols: List[str]) -> List[str]:
     if path and os.path.exists(path):
@@ -195,10 +206,10 @@ holdout_df = load_table(DATA_TEST) if DATA_TEST else pd.DataFrame()
 feature_names = load_feature_names(FEATS_PATH, list(train_df.columns) if not train_df.empty else list(holdout_df.columns))
 
 # Models
-models = {}
-if MODEL_ISO: models["Calibré (Isotonic)"] = load_model(MODEL_ISO)
-if MODEL_SIG: models["Calibré (Sigmoid)"]  = load_model(MODEL_SIG)
-if MODEL_BASE: models["Baseline"]           = load_model(MODEL_BASE)
+model_paths = {}
+if MODEL_ISO: model_paths["Calibré (Isotonic)"] = MODEL_ISO
+if MODEL_SIG: model_paths["Calibré (Sigmoid)"]  = MODEL_SIG
+if MODEL_BASE: model_paths["Baseline"]           = MODEL_BASE
 
 # Interpretability artifacts
 global_imp_df = load_global_importance(GLOBIMP)
@@ -215,8 +226,7 @@ cat_cols = [c for c in feature_names if c not in num_cols]
 # Sidebar controls
 with st.sidebar:
     st.subheader("Paramètres du modèle")
-    model_name = st.selectbox("Choisir le modèle", list(models.keys()) if models else ["—"])
-    model = models.get(model_name)
+    model_name = st.selectbox("Choisir le modèle", list(model_paths.keys()) if model_paths else ["—"])
     threshold = st.slider("Seuil d'acceptation (proba de défaut)", 0.0, 0.5, 0.08, 0.005, help="Au-delà du seuil = risque élevé ⇒ refus")
 
     st.divider()
@@ -238,6 +248,14 @@ else:
     X = pd.DataFrame(columns=feature_names)
     x_row = X.head(0)
     background = X
+
+# Load selected model lazily to avoid importing heavy deps unless needed
+model = None
+if model_name in (model_paths or {}):
+    try:
+        model = safe_load_model(model_paths[model_name])
+    except Exception:
+        model = None
 
 # Prediction
 proba = None
