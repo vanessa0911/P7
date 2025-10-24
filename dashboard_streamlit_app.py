@@ -1,4 +1,4 @@
-# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v0.7.0)
+# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v0.7.1)
 # ----------------------------------------------------------------
 # Run:
 #   python -m streamlit run dashboard_streamlit_app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true
@@ -10,7 +10,7 @@
 # - Global importance (optional): global_importance.csv  (columns: feature, importance)
 # - Interpretability (optional): interpretability_summary.json
 
-APP_VERSION = "0.7.0"
+APP_VERSION = "0.7.1"
 
 import os
 import json
@@ -88,7 +88,7 @@ def load_global_importance(path: Optional[str]) -> Optional[pd.DataFrame]:
 @st.cache_data(show_spinner=False)
 def load_interpretability_summary(path: Optional[str]) -> dict:
     if path and os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f):
             return json.load(f)
     return {}
 
@@ -178,14 +178,18 @@ def cost_at_threshold(y_true: np.ndarray, p: np.ndarray, t: float, cost_fp: floa
 
 def cost_curve(y_true: np.ndarray, p: np.ndarray, cost_fp: float, cost_fn: float, step: float=0.001):
     """Balaye les seuils [0,1] et retourne DataFrame coût vs seuil + seuil optimal."""
-    ts = np.arange(0.0, 1.0+step, step)
+    step = float(step)
+    if step <= 0:
+        step = 0.001
+    ts = np.arange(0.0, 1.0 + step, step)
     rows = []
     for t in ts:
-        m = cost_at_threshold(y_true, p, t, cost_fp, cost_fn)
-        m["threshold"] = t
+        m = cost_at_threshold(y_true, p, float(t), cost_fp, cost_fn)
+        m["threshold"] = float(t)
         rows.append(m)
     df = pd.DataFrame(rows)
-    best_idx = df["cost"].idx_min()
+    # FIX: pandas utilise idxmin() (et non idx_min)
+    best_idx = df["cost"].idxmin()
     best = df.loc[best_idx].to_dict()
     return df, best
 
@@ -597,26 +601,26 @@ with main_tabs[6]:
         with cols[2]:
             cost_fn = st.number_input("Coût d'un FN (acceptation risquée)", min_value=0.0, value=1000.0, step=10.0)
         with cols[3]:
-            max_sample = st.number_input("Taille échantillon (max)", min_value=1000, value=20000, step=1000)
+            max_sample = st.number_input("Taille échantillon (max)", min_value=1000, value=20020, step=1000)
 
         # Jeu de calcul (labeled)
         labeled = pool_df.dropna(subset=[TARGET_COL]).copy()
         if len(labeled) == 0:
             st.warning("Aucune ligne labellisée trouvée (TARGET manquant).")
         else:
-            # Aligner colonnes comme pour X
+            # Aligner colonnes comme pour X (index = ID)
             df_lab = labeled.set_index(ID_COL)
             expected = list(X.columns)
             for c in expected:
                 if c not in df_lab.columns:
                     df_lab[c] = np.nan
             X_all = df_lab[expected]
-            y_all = labeled[TARGET_COL].values.astype(int)
+            y_all = df_lab[TARGET_COL].astype(int)  # <-- aligné sur le même index
 
-            # Sampling pour tenir la perf
+            # Sampling pour tenir la perf (on re-synchronise y via l'index)
             if len(X_all) > max_sample:
                 X_all = X_all.sample(int(max_sample), random_state=42)
-                y_all = y_all[X_all.index.get_indexer(X_all.index)]
+                y_all = y_all.loc[X_all.index]
 
             # Probabilités
             try:
@@ -628,28 +632,32 @@ with main_tabs[6]:
             if p_all is not None:
                 # AUC
                 try:
-                    auc = roc_auc_score(y_all, p_all)
+                    auc = roc_auc_score(y_all.values, p_all)
                 except Exception:
-                    auc = np.nan
+                    auc = float("nan")
 
                 # Courbes ROC / PR
-                fpr, tpr, roc_th = roc_curve(y_all, p_all)
-                prec, rec, pr_th = precision_recall_curve(y_all, p_all)
+                try:
+                    fpr, tpr, roc_th = roc_curve(y_all.values, p_all)
+                    fig_roc = go.Figure()
+                    fig_roc.add_trace(go.Scatter(x=fpr, y=tpr, mode="lines", name=f"ROC (AUC={auc:.3f})"))
+                    fig_roc.add_trace(go.Scatter(x=[0,1], y=[0,1], mode="lines", name="Random", line=dict(dash="dash")))
+                    fig_roc.update_layout(title="Courbe ROC", xaxis_title="FPR", yaxis_title="TPR", height=350)
+                    st.plotly_chart(fig_roc, use_container_width=True)
+                except Exception:
+                    pass
 
-                fig_roc = go.Figure()
-                fig_roc.add_trace(go.Scatter(x=fpr, y=tpr, mode="lines", name=f"ROC (AUC={auc:.3f})"))
-                fig_roc.add_trace(go.Scatter(x=[0,1], y=[0,1], mode="lines", name="Random", line=dict(dash="dash")))
-                fig_roc.update_layout(title="Courbe ROC", xaxis_title="FPR", yaxis_title="TPR", height=350)
+                try:
+                    prec, rec, pr_th = precision_recall_curve(y_all.values, p_all)
+                    fig_pr = go.Figure()
+                    fig_pr.add_trace(go.Scatter(x=rec, y=prec, mode="lines", name="Precision-Recall"))
+                    fig_pr.update_layout(title="Précision–Rappel", xaxis_title="Recall", yaxis_title="Precision", height=350)
+                    st.plotly_chart(fig_pr, use_container_width=True)
+                except Exception:
+                    pass
 
-                fig_pr = go.Figure()
-                fig_pr.add_trace(go.Scatter(x=rec, y=prec, mode="lines", name="Precision-Recall"))
-                fig_pr.update_layout(title="Précision–Rappel", xaxis_title="Recall", yaxis_title="Precision", height=350)
-
-                st.plotly_chart(fig_roc, use_container_width=True)
-                st.plotly_chart(fig_pr, use_container_width=True)
-
-                # Courbe coût vs seuil
-                df_cost, best = cost_curve(y_all, p_all, cost_fp, cost_fn, step=0.001)
+                # Courbe coût vs seuil (avec idxmin fixée)
+                df_cost, best = cost_curve(y_all.values, p_all, cost_fp, cost_fn, step=0.001)
                 fig_cost = go.Figure()
                 fig_cost.add_trace(go.Scatter(x=df_cost["threshold"], y=df_cost["cost"], mode="lines", name="Coût total"))
                 fig_cost.add_vline(x=float(best["threshold"]), line_width=2, line_dash="dash", line_color="green",
@@ -662,7 +670,7 @@ with main_tabs[6]:
                 st.plotly_chart(fig_cost, use_container_width=True)
 
                 # Table métriques (seuil optimal et seuil courant)
-                cur = cost_at_threshold(y_all, p_all, float(st.session_state["threshold"]), cost_fp, cost_fn)
+                cur = cost_at_threshold(y_all.values, p_all, float(st.session_state["threshold"]), cost_fp, cost_fn)
                 best_row = {
                     "Seuil": f"{best['threshold']:.3f}",
                     "Coût total": f"{best['cost']:.0f} {unit}",
