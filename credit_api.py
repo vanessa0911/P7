@@ -1,7 +1,8 @@
-# credit_api.py — FastAPI pour scoring crédit + métriques de masse (v1.0.1)
-# Run local: uvicorn credit_api:app --host 0.0.0.0 --port 8000 --reload
+# credit_api.py — FastAPI pour scoring crédit + métriques de masse (v1.0.2)
+# Run local (debug): uvicorn credit_api:app --host 0.0.0.0 --port 8000 --reload
 
 import os
+import traceback
 from typing import Optional, Dict, Any, List
 
 import numpy as np
@@ -10,7 +11,7 @@ import joblib
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
 # ----------------- Utils chargement -----------------
@@ -82,7 +83,8 @@ for c in expected_cols:
         df_idx[c] = np.nan
 X_all = df_idx[expected_cols]
 
-_bg = X_all.sample(min(200, len(X_all)), random_state=42)
+# Background par défaut pour SHAP (réduit pour fiabiliser en cloud free)
+_BG_BASE = X_all.sample(min(100, len(X_all)), random_state=42)
 
 # ----------------- Métriques & coût -----------------
 from sklearn.metrics import (
@@ -116,14 +118,14 @@ def cost_curve(y_true: np.ndarray, p: np.ndarray, cost_fp: float, cost_fn: float
     return df, best
 
 # ----------------- FastAPI app -----------------
-app = FastAPI(title="Credit Scoring API", version="1.0.1")
+app = FastAPI(title="Credit Scoring API", version="1.0.2")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
 
-# ➜ Route racine: redirige vers /docs (évite {"detail":"Not Found"})
+# Route racine: redirige vers /docs
 @app.get("/", include_in_schema=False)
 def root():
     return RedirectResponse(url="/docs")
@@ -134,6 +136,7 @@ class PredictBody(BaseModel):
     threshold: Optional[float] = 0.08
     shap: Optional[bool] = True
     topk: Optional[int] = 10
+    bg_max: Optional[int] = 80  # taille max du background SHAP (pour Render free)
 
 class MetricsBody(BaseModel):
     cost_fp: float = 100.0
@@ -145,11 +148,9 @@ class MetricsBody(BaseModel):
 def health():
     return {"status": "ok", "model": os.path.basename(model_path), "rows": int(len(X_all))}
 
-# Petit helper pour récupérer quelques IDs de test
 @app.get("/sample_ids")
 def sample_ids(n: int = 5):
     ids = X_all.index[: max(1, min(int(n), len(X_all)))].tolist()
-    # cast en int si possible
     clean = []
     for v in ids:
         try:
@@ -181,22 +182,36 @@ def predict(body: PredictBody):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erreur prédiction: {e}")
 
-    # SHAP (optionnel)
-    top_contrib = []
+    resp: Dict[str, Any] = {"proba_default": proba, "threshold": body.threshold, "top_contrib": []}
+
+    # SHAP (optionnel) — on renvoie aussi le statut/erreur en clair
     if body.shap:
+        shap_status = "ok"
+        shap_error = None
         try:
             import shap
-            bg = _bg
+            bg_base = _BG_BASE
+            bg_max = int(body.bg_max or 80)
+            bg_max = max(20, min(bg_max, len(bg_base)))
+            # échantillonne un background léger pour fiabilité
+            if len(bg_base) > bg_max:
+                bg = bg_base.sample(bg_max, random_state=42)
+            else:
+                bg = bg_base
+
             def f(Xdf):
                 if not isinstance(Xdf, pd.DataFrame):
                     Xdf = pd.DataFrame(Xdf, columns=list(bg.columns))
                 return model.predict_proba(Xdf)[:, 1]
+
             masker = shap.maskers.Independent(bg)
             explainer = shap.Explainer(f, masker, feature_names=list(bg.columns))
             ex = explainer(x_row)
+
             vals = np.array(ex.values).reshape(-1)
             abs_vals = np.abs(vals)
             order = np.argsort(-abs_vals)[: int(body.topk or 10)]
+            top_contrib = []
             for idx in order:
                 feat = bg.columns[idx]
                 top_contrib.append({
@@ -204,10 +219,20 @@ def predict(body: PredictBody):
                     "shap_value": float(vals[idx]),
                     "value": (None if pd.isna(x_row.iloc[0, idx]) else x_row.iloc[0, idx]),
                 })
-        except Exception:
-            top_contrib = []
+            resp["top_contrib"] = top_contrib
+            resp["shap_status"] = shap_status
+            resp["shap_bg_size"] = int(len(bg))
+        except Exception as e:
+            shap_status = "error"
+            shap_error = f"{type(e).__name__}: {str(e)}"
+            # log stack dans les logs Render
+            print("[SHAP ERROR]", shap_error)
+            print(traceback.format_exc())
+            resp["shap_status"] = shap_status
+            resp["shap_error"] = shap_error
+            resp["shap_bg_size"] = 0
 
-    return {"proba_default": proba, "threshold": body.threshold, "top_contrib": top_contrib}
+    return resp
 
 @app.post("/metrics")
 def metrics(body: MetricsBody):
