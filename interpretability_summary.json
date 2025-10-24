@@ -1,0 +1,106 @@
+{
+  "interpretability_method": "shap_tree",
+  "algo": "catboost",
+  "top_global_features": [
+    {
+      "raw_feature": "EXT_SOURCES_MEAN",
+      "abs_importance": 0.37984486387713157,
+      "rank": 1
+    },
+    {
+      "raw_feature": "EXT_SOURCES_SUM",
+      "abs_importance": 0.19272646901451196,
+      "rank": 2
+    },
+    {
+      "raw_feature": "EXT_SOURCE_3",
+      "abs_importance": 0.14692716319714258,
+      "rank": 3
+    },
+    {
+      "raw_feature": "CREDIT_GOODS_RATIO",
+      "abs_importance": 0.13064798787555304,
+      "rank": 4
+    },
+    {
+      "raw_feature": "PAYMENT_RATE",
+      "abs_importance": 0.09027636978739365,
+      "rank": 5
+    },
+    {
+      "raw_feature": "AMT_ANNUITY",
+      "abs_importance": 0.0887599082915537,
+      "rank": 6
+    },
+    {
+      "raw_feature": "CREDIT_TERM_MONTHS",
+      "abs_importance": 0.08421654809358252,
+      "rank": 7
+    },
+    {
+      "raw_feature": "AMT_GOODS_PRICE",
+      "abs_importance": 0.07163674675160155,
+      "rank": 8
+    },
+    {
+      "raw_feature": "DAYS_ID_PUBLISH",
+      "abs_importance": 0.07042986163887242,
+      "rank": 9
+    },
+    {
+      "raw_feature": "EMPLOY_TO_AGE_RATIO",
+      "abs_importance": 0.056835805372207185,
+      "rank": 10
+    },
+    {
+      "raw_feature": "AGE_YEARS",
+      "abs_importance": 0.047325325019859595,
+      "rank": 11
+    },
+    {
+      "raw_feature": "EXT_SOURCE_2",
+      "abs_importance": 0.04284615922424213,
+      "rank": 12
+    },
+    {
+      "raw_feature": "CODE_GENDER",
+      "abs_importance": 0.04130611661056348,
+      "rank": 13
+    },
+    {
+      "raw_feature": "DAYS_LAST_PHONE_CHANGE",
+      "abs_importance": 0.040570599279643106,
+      "rank": 14
+    },
+    {
+      "raw_feature": "DOC_COUNT",
+      "abs_importance": 0.039194518510790546,
+      "rank": 15
+    },
+    {
+      "raw_feature": "OWN_CAR_AGE",
+      "abs_importance": 0.03815935300257515,
+      "rank": 16
+    },
+    {
+      "raw_feature": "FLAG_WORK_PHONE",
+      "abs_importance": 0.03724960447829896,
+      "rank": 17
+    },
+    {
+      "raw_feature": "FLAG_DOCUMENT_3",
+      "abs_importance": 0.035821037239235236,
+      "rank": 18
+    },
+    {
+      "raw_feature": "EMPLOY_YEARS",
+      "abs_importance": 0.035452350835432356,
+      "rank": 19
+    },
+    {
+      "raw_feature": "DAYS_EMPLOYED",
+      "abs_importance": 0.03460630196560657,
+      "rank": 20
+    }
+  ]
+}
