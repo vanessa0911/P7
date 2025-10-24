@@ -1,5 +1,6 @@
-# credit_api.py — FastAPI pour scoring crédit + métriques de masse (v1.0.2)
-# Run local (debug): uvicorn credit_api:app --host 0.0.0.0 --port 8000 --reload
+# credit_api.py — FastAPI pour scoring crédit + métriques (v1.0.3)
+# Corrige SHAP sur colonnes catégorielles (encodage/decode temporaire).
+# Run local: uvicorn credit_api:app --host 0.0.0.0 --port 8000 --reload
 
 import os
 import traceback
@@ -83,8 +84,40 @@ for c in expected_cols:
         df_idx[c] = np.nan
 X_all = df_idx[expected_cols]
 
-# Background par défaut pour SHAP (réduit pour fiabiliser en cloud free)
-_BG_BASE = X_all.sample(min(100, len(X_all)), random_state=42)
+# Colonnes catégorielles = object/string
+CAT_COLS = [c for c in X_all.columns if X_all[c].dtype == "object"]
+NUM_COLS = [c for c in X_all.columns if c not in CAT_COLS]
+
+# Mappings catégoriels globaux (depuis tout X_all) pour stabilité
+CAT_MAPS: Dict[str, Dict[str, int]] = {}
+CAT_INV_MAPS: Dict[str, Dict[int, str]] = {}
+for col in CAT_COLS:
+    vals = pd.Series(X_all[col].astype(str).fillna("NaN").unique())
+    codes = list(range(len(vals)))
+    CAT_MAPS[col] = dict(zip(vals.tolist(), codes))
+    CAT_INV_MAPS[col] = dict(zip(codes, vals.tolist()))
+
+def encode_cats(df: pd.DataFrame) -> pd.DataFrame:
+    """Encode les colonnes catégorielles en codes int (utilisé par SHAP)."""
+    out = df.copy()
+    for col in CAT_COLS:
+        m = CAT_MAPS.get(col, {})
+        s = out[col].astype(str).fillna("NaN")
+        out[col] = s.map(m).fillna(-1).astype(int)
+    return out
+
+def decode_cats(df_num: pd.DataFrame) -> pd.DataFrame:
+    """Decode les colonnes catégorielles codes -> string (avant model.predict_proba)."""
+    out = df_num.copy()
+    for col in CAT_COLS:
+        inv = CAT_INV_MAPS.get(col, {})
+        # on arrondit par sécurité puis cast en int
+        s = pd.to_numeric(out[col], errors="coerce").round().astype("Int64")
+        out[col] = s.map(inv).fillna("NaN").astype(str)
+    return out
+
+# Background réduit (fiable sur small CPUs)
+_BG_BASE = X_all.sample(min(120, len(X_all)), random_state=42)
 
 # ----------------- Métriques & coût -----------------
 from sklearn.metrics import (
@@ -118,7 +151,7 @@ def cost_curve(y_true: np.ndarray, p: np.ndarray, cost_fp: float, cost_fn: float
     return df, best
 
 # ----------------- FastAPI app -----------------
-app = FastAPI(title="Credit Scoring API", version="1.0.2")
+app = FastAPI(title="Credit Scoring API", version="1.0.3")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -136,7 +169,7 @@ class PredictBody(BaseModel):
     threshold: Optional[float] = 0.08
     shap: Optional[bool] = True
     topk: Optional[int] = 10
-    bg_max: Optional[int] = 80  # taille max du background SHAP (pour Render free)
+    bg_max: Optional[int] = 80  # background SHAP max
 
 class MetricsBody(BaseModel):
     cost_fp: float = 100.0
@@ -161,71 +194,83 @@ def sample_ids(n: int = 5):
 
 @app.post("/predict")
 def predict(body: PredictBody):
-    # construire la ligne
+    # 1) Construire la ligne d'entrée (x_row) en valeurs "brutes"
     if body.client_id is not None:
         cid = body.client_id
         if cid not in X_all.index:
             raise HTTPException(status_code=404, detail=f"client_id {cid} introuvable")
-        x_row = X_all.loc[[cid]]
+        x_row_raw = X_all.loc[[cid]]
     elif body.features is not None:
         row = {}
         for c in expected_cols:
             v = body.features.get(c, None)
             row[c] = np.nan if v is None else v
-        x_row = pd.DataFrame([row], columns=expected_cols)
+        x_row_raw = pd.DataFrame([row], columns=expected_cols)
     else:
         raise HTTPException(status_code=400, detail="Fournir client_id OU features")
 
-    # proba
+    # 2) Proba via modèle (avec les valeurs d'origine)
     try:
-        proba = float(model.predict_proba(x_row)[0, 1])
+        proba = float(model.predict_proba(x_row_raw)[0, 1])
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erreur prédiction: {e}")
 
     resp: Dict[str, Any] = {"proba_default": proba, "threshold": body.threshold, "top_contrib": []}
 
-    # SHAP (optionnel) — on renvoie aussi le statut/erreur en clair
+    # 3) SHAP (optionnel) — encode/ decode pour éviter les opérations sur strings
     if body.shap:
         shap_status = "ok"
         shap_error = None
         try:
             import shap
-            bg_base = _BG_BASE
+
+            # Background encodé
+            bg_base_raw = _BG_BASE
             bg_max = int(body.bg_max or 80)
-            bg_max = max(20, min(bg_max, len(bg_base)))
-            # échantillonne un background léger pour fiabilité
-            if len(bg_base) > bg_max:
-                bg = bg_base.sample(bg_max, random_state=42)
+            bg_max = max(20, min(bg_max, len(bg_base_raw)))
+            if len(bg_base_raw) > bg_max:
+                bg_raw = bg_base_raw.sample(bg_max, random_state=42)
             else:
-                bg = bg_base
+                bg_raw = bg_base_raw
 
-            def f(Xdf):
-                if not isinstance(Xdf, pd.DataFrame):
-                    Xdf = pd.DataFrame(Xdf, columns=list(bg.columns))
-                return model.predict_proba(Xdf)[:, 1]
+            bg_num = encode_cats(bg_raw)
+            x_num = encode_cats(x_row_raw)
 
-            masker = shap.maskers.Independent(bg)
-            explainer = shap.Explainer(f, masker, feature_names=list(bg.columns))
-            ex = explainer(x_row)
+            def f_decode_then_predict(Xdf_num):
+                """SHAP nous passe un DataFrame NUMERIQUE (codes). On re-décode pour le modèle."""
+                if not isinstance(Xdf_num, pd.DataFrame):
+                    Xdf_num = pd.DataFrame(Xdf_num, columns=list(bg_num.columns))
+                Xdf_raw = decode_cats(Xdf_num)
+                # conserver les colonnes numériques telles quelles
+                for col in NUM_COLS:
+                    if col in Xdf_num.columns:
+                        Xdf_raw[col] = Xdf_num[col]
+                return model.predict_proba(Xdf_raw)[:, 1]
+
+            masker = shap.maskers.Independent(bg_num)
+            explainer = shap.Explainer(f_decode_then_predict, masker, feature_names=list(bg_num.columns))
+            ex = explainer(x_num)
 
             vals = np.array(ex.values).reshape(-1)
             abs_vals = np.abs(vals)
             order = np.argsort(-abs_vals)[: int(body.topk or 10)]
             top_contrib = []
             for idx in order:
-                feat = bg.columns[idx]
+                feat = bg_num.columns[idx]
+                # valeur d'origine (lisible) pour l'affichage
+                orig_val = x_row_raw.iloc[0][feat] if feat in x_row_raw.columns else None
                 top_contrib.append({
                     "feature": str(feat),
                     "shap_value": float(vals[idx]),
-                    "value": (None if pd.isna(x_row.iloc[0, idx]) else x_row.iloc[0, idx]),
+                    "value": (None if pd.isna(orig_val) else orig_val),
                 })
+
             resp["top_contrib"] = top_contrib
             resp["shap_status"] = shap_status
-            resp["shap_bg_size"] = int(len(bg))
+            resp["shap_bg_size"] = int(len(bg_num))
         except Exception as e:
             shap_status = "error"
             shap_error = f"{type(e).__name__}: {str(e)}"
-            # log stack dans les logs Render
             print("[SHAP ERROR]", shap_error)
             print(traceback.format_exc())
             resp["shap_status"] = shap_status
