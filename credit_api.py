@@ -1,5 +1,6 @@
-# credit_api.py — FastAPI pour scoring crédit + métriques (v1.0.3)
-# Corrige SHAP sur colonnes catégorielles (encodage/decode temporaire).
+# credit_api.py — FastAPI pour scoring crédit + métriques (v1.0.4)
+# - Capture toute exception dans /predict et renvoie un JSON détaillé (évite "Internal Server Error")
+# - SHAP robuste : encode temporairement les colonnes catégorielles (object) puis redécode pour le modèle
 # Run local: uvicorn credit_api:app --host 0.0.0.0 --port 8000 --reload
 
 import os
@@ -12,7 +13,7 @@ import joblib
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, JSONResponse
 from pydantic import BaseModel
 
 # ----------------- Utils chargement -----------------
@@ -84,11 +85,11 @@ for c in expected_cols:
         df_idx[c] = np.nan
 X_all = df_idx[expected_cols]
 
-# Colonnes catégorielles = object/string
+# Colonnes catégorielles & numériques (pour SHAP)
 CAT_COLS = [c for c in X_all.columns if X_all[c].dtype == "object"]
 NUM_COLS = [c for c in X_all.columns if c not in CAT_COLS]
 
-# Mappings catégoriels globaux (depuis tout X_all) pour stabilité
+# Mappings catégoriels stables (depuis tout X_all)
 CAT_MAPS: Dict[str, Dict[str, int]] = {}
 CAT_INV_MAPS: Dict[str, Dict[int, str]] = {}
 for col in CAT_COLS:
@@ -98,7 +99,7 @@ for col in CAT_COLS:
     CAT_INV_MAPS[col] = dict(zip(codes, vals.tolist()))
 
 def encode_cats(df: pd.DataFrame) -> pd.DataFrame:
-    """Encode les colonnes catégorielles en codes int (utilisé par SHAP)."""
+    """Encode les colonnes catégorielles en codes int (pour SHAP)."""
     out = df.copy()
     for col in CAT_COLS:
         m = CAT_MAPS.get(col, {})
@@ -111,12 +112,11 @@ def decode_cats(df_num: pd.DataFrame) -> pd.DataFrame:
     out = df_num.copy()
     for col in CAT_COLS:
         inv = CAT_INV_MAPS.get(col, {})
-        # on arrondit par sécurité puis cast en int
         s = pd.to_numeric(out[col], errors="coerce").round().astype("Int64")
         out[col] = s.map(inv).fillna("NaN").astype(str)
     return out
 
-# Background réduit (fiable sur small CPUs)
+# Background réduit pour SHAP
 _BG_BASE = X_all.sample(min(120, len(X_all)), random_state=42)
 
 # ----------------- Métriques & coût -----------------
@@ -151,7 +151,7 @@ def cost_curve(y_true: np.ndarray, p: np.ndarray, cost_fp: float, cost_fn: float
     return df, best
 
 # ----------------- FastAPI app -----------------
-app = FastAPI(title="Credit Scoring API", version="1.0.3")
+app = FastAPI(title="Credit Scoring API", version="1.0.4")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -194,90 +194,98 @@ def sample_ids(n: int = 5):
 
 @app.post("/predict")
 def predict(body: PredictBody):
-    # 1) Construire la ligne d'entrée (x_row) en valeurs "brutes"
-    if body.client_id is not None:
-        cid = body.client_id
-        if cid not in X_all.index:
-            raise HTTPException(status_code=404, detail=f"client_id {cid} introuvable")
-        x_row_raw = X_all.loc[[cid]]
-    elif body.features is not None:
-        row = {}
-        for c in expected_cols:
-            v = body.features.get(c, None)
-            row[c] = np.nan if v is None else v
-        x_row_raw = pd.DataFrame([row], columns=expected_cols)
-    else:
-        raise HTTPException(status_code=400, detail="Fournir client_id OU features")
-
-    # 2) Proba via modèle (avec les valeurs d'origine)
+    # === Filet de sécurité global: aucune 500 "muette" ===
     try:
-        proba = float(model.predict_proba(x_row_raw)[0, 1])
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur prédiction: {e}")
+        # 1) Construire la ligne d'entrée (x_row) en valeurs "brutes"
+        if body.client_id is not None:
+            cid = body.client_id
+            if cid not in X_all.index:
+                raise HTTPException(status_code=404, detail=f"client_id {cid} introuvable")
+            x_row_raw = X_all.loc[[cid]]
+        elif body.features is not None:
+            row = {}
+            for c in expected_cols:
+                v = body.features.get(c, None)
+                row[c] = np.nan if v is None else v
+            x_row_raw = pd.DataFrame([row], columns=expected_cols)
+        else:
+            raise HTTPException(status_code=400, detail="Fournir client_id OU features")
 
-    resp: Dict[str, Any] = {"proba_default": proba, "threshold": body.threshold, "top_contrib": []}
-
-    # 3) SHAP (optionnel) — encode/ decode pour éviter les opérations sur strings
-    if body.shap:
-        shap_status = "ok"
-        shap_error = None
+        # 2) Proba via modèle (avec les valeurs d'origine)
         try:
-            import shap
-
-            # Background encodé
-            bg_base_raw = _BG_BASE
-            bg_max = int(body.bg_max or 80)
-            bg_max = max(20, min(bg_max, len(bg_base_raw)))
-            if len(bg_base_raw) > bg_max:
-                bg_raw = bg_base_raw.sample(bg_max, random_state=42)
-            else:
-                bg_raw = bg_base_raw
-
-            bg_num = encode_cats(bg_raw)
-            x_num = encode_cats(x_row_raw)
-
-            def f_decode_then_predict(Xdf_num):
-                """SHAP nous passe un DataFrame NUMERIQUE (codes). On re-décode pour le modèle."""
-                if not isinstance(Xdf_num, pd.DataFrame):
-                    Xdf_num = pd.DataFrame(Xdf_num, columns=list(bg_num.columns))
-                Xdf_raw = decode_cats(Xdf_num)
-                # conserver les colonnes numériques telles quelles
-                for col in NUM_COLS:
-                    if col in Xdf_num.columns:
-                        Xdf_raw[col] = Xdf_num[col]
-                return model.predict_proba(Xdf_raw)[:, 1]
-
-            masker = shap.maskers.Independent(bg_num)
-            explainer = shap.Explainer(f_decode_then_predict, masker, feature_names=list(bg_num.columns))
-            ex = explainer(x_num)
-
-            vals = np.array(ex.values).reshape(-1)
-            abs_vals = np.abs(vals)
-            order = np.argsort(-abs_vals)[: int(body.topk or 10)]
-            top_contrib = []
-            for idx in order:
-                feat = bg_num.columns[idx]
-                # valeur d'origine (lisible) pour l'affichage
-                orig_val = x_row_raw.iloc[0][feat] if feat in x_row_raw.columns else None
-                top_contrib.append({
-                    "feature": str(feat),
-                    "shap_value": float(vals[idx]),
-                    "value": (None if pd.isna(orig_val) else orig_val),
-                })
-
-            resp["top_contrib"] = top_contrib
-            resp["shap_status"] = shap_status
-            resp["shap_bg_size"] = int(len(bg_num))
+            proba = float(model.predict_proba(x_row_raw)[0, 1])
         except Exception as e:
-            shap_status = "error"
-            shap_error = f"{type(e).__name__}: {str(e)}"
-            print("[SHAP ERROR]", shap_error)
-            print(traceback.format_exc())
-            resp["shap_status"] = shap_status
-            resp["shap_error"] = shap_error
-            resp["shap_bg_size"] = 0
+            raise HTTPException(status_code=500, detail=f"Erreur prédiction: {e}")
 
-    return resp
+        resp: Dict[str, Any] = {
+            "proba_default": proba, "threshold": body.threshold, "top_contrib": []
+        }
+
+        # 3) SHAP (optionnel) — encode/décode pour éviter opérations sur strings
+        if body.shap:
+            shap_status = "ok"
+            try:
+                import shap
+
+                bg_base_raw = _BG_BASE
+                bg_max = int(body.bg_max or 80)
+                bg_max = max(20, min(bg_max, len(bg_base_raw)))
+                if len(bg_base_raw) > bg_max:
+                    bg_raw = bg_base_raw.sample(bg_max, random_state=42)
+                else:
+                    bg_raw = bg_base_raw
+
+                bg_num = encode_cats(bg_raw)
+                x_num = encode_cats(x_row_raw)
+
+                def f_decode_then_predict(Xdf_num):
+                    if not isinstance(Xdf_num, pd.DataFrame):
+                        Xdf_num = pd.DataFrame(Xdf_num, columns=list(bg_num.columns))
+                    Xdf_raw = decode_cats(Xdf_num)
+                    for col in NUM_COLS:
+                        if col in Xdf_num.columns:
+                            Xdf_raw[col] = Xdf_num[col]
+                    return model.predict_proba(Xdf_raw)[:, 1]
+
+                masker = shap.maskers.Independent(bg_num)
+                explainer = shap.Explainer(f_decode_then_predict, masker, feature_names=list(bg_num.columns))
+                ex = explainer(x_num)
+
+                vals = np.array(ex.values).reshape(-1)
+                abs_vals = np.abs(vals)
+                order = np.argsort(-abs_vals)[: int(body.topk or 10)]
+                top_contrib = []
+                for idx in order:
+                    feat = bg_num.columns[idx]
+                    orig_val = x_row_raw.iloc[0][feat] if feat in x_row_raw.columns else None
+                    top_contrib.append({
+                        "feature": str(feat),
+                        "shap_value": float(vals[idx]),
+                        "value": (None if pd.isna(orig_val) else orig_val),
+                    })
+                resp["top_contrib"] = top_contrib
+                resp["shap_status"] = shap_status
+                resp["shap_bg_size"] = int(len(bg_num))
+            except Exception as e:
+                shap_status = "error"
+                shap_error = f"{type(e).__name__}: {str(e)}"
+                print("[SHAP ERROR]", shap_error)
+                print(traceback.format_exc())
+                resp["shap_status"] = shap_status
+                resp["shap_error"] = shap_error
+                resp["shap_bg_size"] = 0
+
+        return resp
+
+    except HTTPException as he:
+        # Erreurs "connues" (404, 400, etc.) → JSON propre
+        return JSONResponse(status_code=he.status_code, content={"detail": he.detail})
+    except Exception as e:
+        # Filet global: plus de 500 "Internal Server Error" muet
+        err = f"{type(e).__name__}: {str(e)}"
+        print("[PREDICT ERROR]", err)
+        print(traceback.format_exc())
+        return JSONResponse(status_code=500, content={"detail": err})
 
 @app.post("/metrics")
 def metrics(body: MetricsBody):
