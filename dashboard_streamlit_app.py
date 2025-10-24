@@ -1,4 +1,4 @@
-# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v0.7.1)
+# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v0.7.2)
 # ----------------------------------------------------------------
 # Run:
 #   python -m streamlit run dashboard_streamlit_app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true
@@ -10,7 +10,7 @@
 # - Global importance (optional): global_importance.csv  (columns: feature, importance)
 # - Interpretability (optional): interpretability_summary.json
 
-APP_VERSION = "0.7.1"
+APP_VERSION = "0.7.2"
 
 import os
 import json
@@ -88,7 +88,7 @@ def load_global_importance(path: Optional[str]) -> Optional[pd.DataFrame]:
 @st.cache_data(show_spinner=False)
 def load_interpretability_summary(path: Optional[str]) -> dict:
     if path and os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f):
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
 
@@ -174,23 +174,27 @@ def cost_at_threshold(y_true: np.ndarray, p: np.ndarray, t: float, cost_fp: floa
     prec = precision_score(y_true, y_pred, zero_division=0)
     rec  = recall_score(y_true, y_pred, zero_division=0)
     f1   = f1_score(y_true, y_pred, zero_division=0)
-    return dict(cost=cost, tn=tn, fp=fp, fn=fn, tp=tp, precision=prec, recall=rec, f1=f1)
+    return dict(cost=float(cost), tn=int(tn), fp=int(fp), fn=int(fn), tp=int(tp),
+                precision=float(prec), recall=float(rec), f1=float(f1))
 
 def cost_curve(y_true: np.ndarray, p: np.ndarray, cost_fp: float, cost_fn: float, step: float=0.001):
     """Balaye les seuils [0,1] et retourne DataFrame coût vs seuil + seuil optimal."""
     step = float(step)
     if step <= 0:
         step = 0.001
-    ts = np.arange(0.0, 1.0 + step, step)
+    ts = np.arange(0.0, 1.0 + step, step, dtype=float)
     rows = []
     for t in ts:
         m = cost_at_threshold(y_true, p, float(t), cost_fp, cost_fn)
         m["threshold"] = float(t)
         rows.append(m)
     df = pd.DataFrame(rows)
-    # FIX: pandas utilise idxmin() (et non idx_min)
-    best_idx = df["cost"].idxmin()
-    best = df.loc[best_idx].to_dict()
+    # >>> Robust: use NumPy to select the min position (no Series.idx_* call)
+    cost_arr = pd.to_numeric(df["cost"], errors="coerce").to_numpy()
+    # Replace NaN by +inf so they are ignored by argmin
+    cost_arr = np.where(np.isfinite(cost_arr), cost_arr, np.inf)
+    best_pos = int(np.argmin(cost_arr))
+    best = df.iloc[best_pos].to_dict()
     return df, best
 
 # -------------------------------
@@ -303,7 +307,11 @@ with main_tabs[0]:
     if proba is None:
         st.warning("Modèle ou données indisponibles pour calculer une probabilité.")
     else:
-        band, color = prob_to_band(proba)
+        def prob_to_band_local(p: float):
+            if p < 0.05: return ("Faible", "#3CB371")
+            if p < 0.15: return ("Modérée", "#E6B800")
+            return ("Élevée", "#E74C3C")
+        band, color = prob_to_band_local(proba)
         col1, col2 = st.columns([1, 2])
         with col1:
             fig = go.Figure(go.Indicator(
@@ -539,7 +547,11 @@ with main_tabs[5]:
             new_x = new_x[exp_cols]
             try:
                 new_p = float(model.predict_proba(new_x)[0, 1])
-                band, color = prob_to_band(new_p)
+                def prob_to_band_local(p: float):
+                    if p < 0.05: return ("Faible", "#3CB371")
+                    if p < 0.15: return ("Modérée", "#E6B800")
+                    return ("Élevée", "#E74C3C")
+                band, color = prob_to_band_local(new_p)
                 fig = go.Figure(go.Indicator(
                     mode="gauge+number",
                     value=new_p * 100,
@@ -601,7 +613,7 @@ with main_tabs[6]:
         with cols[2]:
             cost_fn = st.number_input("Coût d'un FN (acceptation risquée)", min_value=0.0, value=1000.0, step=10.0)
         with cols[3]:
-            max_sample = st.number_input("Taille échantillon (max)", min_value=1000, value=20020, step=1000)
+            max_sample = st.number_input("Taille échantillon (max)", min_value=1000, value=20000, step=1000)
 
         # Jeu de calcul (labeled)
         labeled = pool_df.dropna(subset=[TARGET_COL]).copy()
@@ -615,7 +627,7 @@ with main_tabs[6]:
                 if c not in df_lab.columns:
                     df_lab[c] = np.nan
             X_all = df_lab[expected]
-            y_all = df_lab[TARGET_COL].astype(int)  # <-- aligné sur le même index
+            y_all = df_lab[TARGET_COL].astype(int)  # aligné sur le même index
 
             # Sampling pour tenir la perf (on re-synchronise y via l'index)
             if len(X_all) > max_sample:
@@ -656,7 +668,7 @@ with main_tabs[6]:
                 except Exception:
                     pass
 
-                # Courbe coût vs seuil (avec idxmin fixée)
+                # Courbe coût vs seuil — robust min (NumPy)
                 df_cost, best = cost_curve(y_all.values, p_all, cost_fp, cost_fn, step=0.001)
                 fig_cost = go.Figure()
                 fig_cost.add_trace(go.Scatter(x=df_cost["threshold"], y=df_cost["cost"], mode="lines", name="Coût total"))
