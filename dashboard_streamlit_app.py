@@ -1,4 +1,4 @@
-# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v0.7.2)
+# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v0.7.3)
 # ----------------------------------------------------------------
 # Run:
 #   python -m streamlit run dashboard_streamlit_app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true
@@ -10,10 +10,14 @@
 # - Global importance (optional): global_importance.csv  (columns: feature, importance)
 # - Interpretability (optional): interpretability_summary.json
 
-APP_VERSION = "0.7.2"
+APP_VERSION = "0.7.3"
 
 import os
 import json
+import subprocess
+import hashlib
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
 import joblib
@@ -33,9 +37,32 @@ from sklearn.metrics import (
 st.set_page_config(page_title="Prêt à dépenser — Credit Scoring", page_icon="💳", layout="wide")
 
 # -------------------------------
+# Runtime diagnostics (to verify file actually running)
+# -------------------------------
+def _runtime_info():
+    try:
+        path = os.path.abspath(__file__)
+    except NameError:
+        path = "(unknown)"
+    try:
+        mtime = os.path.getmtime(path)
+        mtime_str = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        mtime_str = "n/a"
+    try:
+        with open(path, "rb") as f:
+            sha = hashlib.sha256(f.read()).hexdigest()[:8]
+    except Exception:
+        sha = "n/a"
+    try:
+        git = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"]).decode().strip()
+    except Exception:
+        git = "n/a"
+    return path, mtime_str, sha, git
+
+# -------------------------------
 # Helpers
 # -------------------------------
-
 def _pick_first_existing(paths: List[str]) -> Optional[str]:
     for p in paths:
         if p and os.path.exists(p):
@@ -129,7 +156,6 @@ def compute_local_shap(estimator, X_background: pd.DataFrame, x_row: pd.DataFram
     return np.array(ex.values).reshape(-1), np.array(ex.base_values).reshape(-1)
 
 # ---- quantiles robustes (évite les KeyError) ----
-
 def get_quantile_series(feature: str, pool_df: pd.DataFrame, X: pd.DataFrame) -> Optional[pd.Series]:
     """
     Série utilisée pour les quantiles :
@@ -164,7 +190,6 @@ def prob_to_band(p: float, low=0.05, high=0.15) -> Tuple[str, str]:
     return ("Élevée", "#E74C3C")
 
 # ---- coût métier ----
-
 def cost_at_threshold(y_true: np.ndarray, p: np.ndarray, t: float, cost_fp: float, cost_fn: float):
     """Calcule coût total + métriques au seuil t."""
     y_pred = (p >= t).astype(int)  # 1 = défaut prédit (refus)
@@ -189,10 +214,9 @@ def cost_curve(y_true: np.ndarray, p: np.ndarray, cost_fp: float, cost_fn: float
         m["threshold"] = float(t)
         rows.append(m)
     df = pd.DataFrame(rows)
-    # >>> Robust: use NumPy to select the min position (no Series.idx_* call)
+    # Robust min selection (no Series.idx_* calls)
     cost_arr = pd.to_numeric(df["cost"], errors="coerce").to_numpy()
-    # Replace NaN by +inf so they are ignored by argmin
-    cost_arr = np.where(np.isfinite(cost_arr), cost_arr, np.inf)
+    cost_arr = np.where(np.isfinite(cost_arr), cost_arr, np.inf)  # replace NaN by +inf
     best_pos = int(np.argmin(cost_arr))
     best = df.iloc[best_pos].to_dict()
     return df, best
@@ -216,7 +240,19 @@ INTERP_SUM = _pick_first_existing(["interpretability_summary.json"])
 with st.sidebar:
     st.title("💳 Scoring Crédit — Dashboard")
     st.caption("Prêt à dépenser — transparence & explicabilité")
+
+    # Diagnostics de version/fichier
+    path, mtime_str, sha8, git = _runtime_info()
     st.caption(f"App version: {APP_VERSION}")
+    st.caption(f"Fichier: {os.path.basename(path)}")
+    st.caption(f"Dernière modif: {mtime_str}")
+    st.caption(f"SHA fichier: {sha8} | Git: {git}")
+
+    if st.button("🔄 Forcer rechargement (vider cache)"):
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        st.experimental_rerun()
+
     if not DATA_TRAIN:
         st.error("⚠️ Données non trouvées (placez `clients_demo.csv` ou `clients_demo.parquet` à la racine)")
 
@@ -307,11 +343,11 @@ with main_tabs[0]:
     if proba is None:
         st.warning("Modèle ou données indisponibles pour calculer une probabilité.")
     else:
-        def prob_to_band_local(p: float):
+        def _band(p: float):
             if p < 0.05: return ("Faible", "#3CB371")
             if p < 0.15: return ("Modérée", "#E6B800")
             return ("Élevée", "#E74C3C")
-        band, color = prob_to_band_local(proba)
+        band, color = _band(proba)
         col1, col2 = st.columns([1, 2])
         with col1:
             fig = go.Figure(go.Indicator(
@@ -372,7 +408,7 @@ with main_tabs[1]:
         st.dataframe(pretty, use_container_width=True)
 
 # -------------------------------
-# Tab 3 — Comparison (client vs population or similar group)
+# Tab 3 — Comparison
 # -------------------------------
 with main_tabs[2]:
     st.subheader("Comparaison du client")
@@ -390,13 +426,11 @@ with main_tabs[2]:
             cohort_df = cohort_df[cohort_df[c] == pool_df.loc[pool_df[ID_COL] == selected_id, c].iloc[0]]
         st.caption(f"Taille de la cohorte similaire : **{len(cohort_df):,}**")
 
-        # Candidats depuis l'importance globale ou les colonnes du modèle
         if global_imp_df is not None and not global_imp_df.empty:
             cand = [f for f in global_imp_df["feature"].tolist() if (f in X.columns or f in pool_df.columns)]
         else:
             cand = [f for f in list(X.columns) if (f in X.columns or f in pool_df.columns)]
 
-        # On garde celles pour lesquelles on a AU MOINS une série numérique valide (pool_df ou X)
         comp_feats = []
         for f in cand:
             if get_quantile_series(f, pool_df, X) is not None:
@@ -500,12 +534,10 @@ with main_tabs[5]:
                 st.error(f"Impossible de lire le CSV : {e}")
 
         if manual and new_x is None:
-            # Variables clés = topK par importance globale si dispo, sinon premières colonnes
             if global_imp_df is not None and not global_imp_df.empty:
                 keys = [f for f in global_imp_df["feature"].tolist() if f in X.columns][:topk]
             else:
                 keys = list(X.columns)[:topk]
-            # Séparer numériques / catégorielles parmi ces clés
             num_cand = [f for f in keys if pd.api.types.is_numeric_dtype(X[f])]
             cat_cand = [f for f in keys if f not in num_cand]
 
@@ -524,7 +556,6 @@ with main_tabs[5]:
                     opts = sorted(series.unique().tolist()[:50]) or ["NA"]
                     inputs[f] = st.selectbox(f, options=opts, index=(opts.index(mode) if mode in opts else 0))
 
-            # Option: pré-remplir depuis le client sélectionné
             with st.expander("Pré-remplir depuis le client sélectionné"):
                 if not x_row.empty:
                     if st.button("Copier les valeurs du client sélectionné"):
@@ -547,11 +578,11 @@ with main_tabs[5]:
             new_x = new_x[exp_cols]
             try:
                 new_p = float(model.predict_proba(new_x)[0, 1])
-                def prob_to_band_local(p: float):
+                def _band(p: float):
                     if p < 0.05: return ("Faible", "#3CB371")
                     if p < 0.15: return ("Modérée", "#E6B800")
                     return ("Élevée", "#E74C3C")
-                band, color = prob_to_band_local(new_p)
+                band, color = _band(new_p)
                 fig = go.Figure(go.Indicator(
                     mode="gauge+number",
                     value=new_p * 100,
@@ -572,7 +603,6 @@ with main_tabs[5]:
                     st.plotly_chart(px.bar(ld[::-1], x="shap_value", y="feature", orientation="h"), use_container_width=True)
                 except Exception as e:
                     st.info(f"SHAP non disponible: {e}")
-                # comparaison quantiles sur X (espace aligné)
                 if global_imp_df is not None and not global_imp_df.empty:
                     comp_feats = [f for f in global_imp_df.head(6)["feature"].tolist() if f in X.columns and pd.api.types.is_numeric_dtype(X[f])]
                 else:
@@ -604,7 +634,6 @@ with main_tabs[6]:
     if model is None or X.empty or TARGET_COL is None:
         st.info("Pour optimiser le seuil, il faut : un modèle chargé, des données et la colonne TARGET.")
     else:
-        # Paramètres métier
         cols = st.columns(4)
         with cols[0]:
             unit = st.selectbox("Unité monétaire", ["€", "CHF", "USD"], index=0)
@@ -615,12 +644,10 @@ with main_tabs[6]:
         with cols[3]:
             max_sample = st.number_input("Taille échantillon (max)", min_value=1000, value=20000, step=1000)
 
-        # Jeu de calcul (labeled)
         labeled = pool_df.dropna(subset=[TARGET_COL]).copy()
         if len(labeled) == 0:
             st.warning("Aucune ligne labellisée trouvée (TARGET manquant).")
         else:
-            # Aligner colonnes comme pour X (index = ID)
             df_lab = labeled.set_index(ID_COL)
             expected = list(X.columns)
             for c in expected:
@@ -629,12 +656,10 @@ with main_tabs[6]:
             X_all = df_lab[expected]
             y_all = df_lab[TARGET_COL].astype(int)  # aligné sur le même index
 
-            # Sampling pour tenir la perf (on re-synchronise y via l'index)
             if len(X_all) > max_sample:
                 X_all = X_all.sample(int(max_sample), random_state=42)
                 y_all = y_all.loc[X_all.index]
 
-            # Probabilités
             try:
                 p_all = model.predict_proba(X_all)[:, 1]
             except Exception as e:
@@ -642,13 +667,11 @@ with main_tabs[6]:
                 p_all = None
 
             if p_all is not None:
-                # AUC
                 try:
                     auc = roc_auc_score(y_all.values, p_all)
                 except Exception:
                     auc = float("nan")
 
-                # Courbes ROC / PR
                 try:
                     fpr, tpr, roc_th = roc_curve(y_all.values, p_all)
                     fig_roc = go.Figure()
@@ -668,7 +691,6 @@ with main_tabs[6]:
                 except Exception:
                     pass
 
-                # Courbe coût vs seuil — robust min (NumPy)
                 df_cost, best = cost_curve(y_all.values, p_all, cost_fp, cost_fn, step=0.001)
                 fig_cost = go.Figure()
                 fig_cost.add_trace(go.Scatter(x=df_cost["threshold"], y=df_cost["cost"], mode="lines", name="Coût total"))
@@ -681,7 +703,6 @@ with main_tabs[6]:
                 fig_cost.update_layout(title=f"Coût vs Seuil ({unit})", xaxis_title="Seuil", yaxis_title=f"Coût total ({unit})", height=350)
                 st.plotly_chart(fig_cost, use_container_width=True)
 
-                # Table métriques (seuil optimal et seuil courant)
                 cur = cost_at_threshold(y_all.values, p_all, float(st.session_state["threshold"]), cost_fp, cost_fn)
                 best_row = {
                     "Seuil": f"{best['threshold']:.3f}",
