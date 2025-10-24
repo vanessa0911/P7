@@ -1,20 +1,20 @@
-# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v0.8.1)
+# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v0.8.2)
 # ----------------------------------------------------------------
 # Run:
 #   python -m streamlit run dashboard_streamlit_app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true
 #
 # Modes de scoring:
-#   - Local (modèle .joblib embarqué) — comme avant
-#   - API FastAPI (credit_api.py) — appelle /predict pour une prédiction et des explications
+#   - Local (modèle .joblib embarqué)
+#   - API FastAPI (credit_api.py) — appelle /predict pour une prédiction + explications
 #
-# Fichiers détectés à la racine:
+# Fichiers détectés à la racine (pas d'arborescence nécessaire) :
 # - Data:  application_train_clean.csv  |  clients_demo.csv  |  clients_demo.parquet
 # - Model: model_calibrated_isotonic.joblib | model_calibrated_sigmoid.joblib | model_baseline_logreg.joblib
 # - Features (optional): feature_names.npy
 # - Global importance (optional): global_importance.csv
 # - Interpretability (optional): interpretability_summary.json
 
-APP_VERSION = "0.8.1"
+APP_VERSION = "0.8.2"
 
 import os
 import json
@@ -238,6 +238,8 @@ def build_client_report_pdf(
     global_imp_df: Optional[pd.DataFrame],
     shap_vals: Optional[pd.DataFrame] = None,
 ) -> bytes:
+    if not REPORTLAB_AVAILABLE:
+        return b""
     buf = BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=1.5*cm, rightMargin=1.5*cm, topMargin=1.2*cm, bottomMargin=1.2*cm)
     styles = getSampleStyleSheet()
@@ -245,7 +247,8 @@ def build_client_report_pdf(
     styles.add(ParagraphStyle(name="H2", fontSize=13, leading=16, spaceBefore=10, spaceAfter=6))
     styles.add(ParagraphStyle(name="Small", fontSize=9, leading=12, textColor="#555555"))
 
-    story, now = [], datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    story = []
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     story.append(Paragraph("Prêt à dépenser — Fiche client", styles["TitleBig"]))
     header = f"Date: {now} • App: {APP_VERSION} • Modèle/Mode: {model_name} • Client: {client_id}"
     story.append(Paragraph(header, styles["Small"]))
@@ -271,7 +274,8 @@ def build_client_report_pdf(
         ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
         ("FONTSIZE", (0,0), (-1,-1), 10),
     ]))
-    story.append(t); story.append(Spacer(1, 8))
+    story.append(t)
+    story.append(Spacer(1, 8))
 
     story.append(Paragraph("Contributions locales (top 10)", styles["H2"]))
     if shap_vals is not None and not shap_vals.empty:
@@ -294,7 +298,8 @@ def build_client_report_pdf(
         ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
         ("FONTSIZE", (0,0), (-1,-1), 9),
     ]))
-    story.append(t2); story.append(Spacer(1, 8))
+    story.append(t2)
+    story.append(Spacer(1, 8))
 
     story.append(Paragraph("Variables clés", styles["H2"]))
     if global_imp_df is not None and not global_imp_df.empty:
@@ -314,7 +319,8 @@ def build_client_report_pdf(
         ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
         ("FONTSIZE", (0,0), (-1,-1), 9),
     ]))
-    story.append(t3); story.append(Spacer(1, 8))
+    story.append(t3)
+    story.append(Spacer(1, 8))
 
     story.append(Paragraph("Positionnement vs population (P10 / P50 / P90)", styles["H2"]))
     if global_imp_df is not None and not global_imp_df.empty:
@@ -474,6 +480,7 @@ with main_tabs[0]:
     proba = None
     shap_df = None
     source_label = "Local"
+
     # ==== PREDICTION ====
     if mode == "API FastAPI":
         if not api_base or not api_ok:
@@ -484,7 +491,6 @@ with main_tabs[0]:
                 resp = api_predict(api_base, payload)
                 proba = float(resp["proba_default"])
                 source_label = "API"
-                # Top contrib renvoyées par l'API (si shap=True)
                 if resp.get("top_contrib"):
                     rows = []
                     for r in resp["top_contrib"]:
@@ -499,10 +505,8 @@ with main_tabs[0]:
                 st.warning(f"API KO ({e}). Bascule en mode Local si un modèle est disponible.")
                 if model_local is None:
                     st.stop()
-                # fallback local
                 proba = float(model_local.predict_proba(x_row)[0, 1])
     else:
-        # Local
         if model_local is None or x_row.empty:
             st.warning("Modèle local ou données indisponibles.")
         else:
@@ -511,7 +515,6 @@ with main_tabs[0]:
     if proba is None:
         st.stop()
 
-    # rendu
     def _band(p: float):
         if p < 0.05: return ("Faible", "#3CB371")
         if p < 0.15: return ("Modérée", "#E6B800")
@@ -519,4 +522,327 @@ with main_tabs[0]:
     band, color = _band(proba)
 
     col1, col2 = st.columns([1, 2])
-    with col
+    with col1:
+        fig = go.Figure(go.Indicator(
+            mode="gauge+number",
+            value=proba * 100,
+            number={"suffix": "%"},
+            gauge={"axis": {"range": [0, 100]},
+                   "bar": {"color": color},
+                   "steps": [
+                       {"range": [0, threshold * 100], "color": "#ecf8f3"},
+                       {"range": [threshold * 100, 100], "color": "#fdecea"},
+                   ]},
+            title={"text": "Probabilité de défaut"},
+        ))
+        st.plotly_chart(fig, use_container_width=True)
+        st.markdown(f"**Décision (seuil {threshold:.3f})** : **{'Refus' if proba >= threshold else 'Accord'}**")
+        st.markdown(f"Risque : **{band}**")
+        st.caption(f"Source: **{source_label}**")
+
+    with col2:
+        st.markdown("**Contributions locales (Top 10)**")
+        if mode == "API FastAPI" and shap_df is not None and not shap_df.empty:
+            bar = px.bar(shap_df.sort_values("abs_val").tail(10), x="shap_value", y="feature", orientation="h",
+                         hover_data={"value": True, "abs_val": False},
+                         title="Impact sur le score (positif = ↑ risque)")
+            st.plotly_chart(bar, use_container_width=True)
+        else:
+            shap_enabled = st.toggle("Activer SHAP local (expérimental)", value=False,
+                                     help="Explication locale côté dashboard (peut être lent).")
+            if shap_enabled and not background.empty and model_local is not None:
+                try:
+                    vals, base_vals = compute_local_shap(model_local, background, x_row)
+                    shap_df_local = pd.DataFrame({
+                        "feature": list(X.columns),
+                        "shap_value": vals,
+                        "abs_val": np.abs(vals),
+                        "value": x_row.iloc[0].values,
+                    }).sort_values("abs_val", ascending=False)
+                    bar = px.bar(shap_df_local.head(10)[::-1], x="shap_value", y="feature", orientation="h",
+                                 hover_data={"value": True, "abs_val": False},
+                                 title="Impact sur le score (positif = ↑ risque)")
+                    st.plotly_chart(bar, use_container_width=True)
+                except Exception as e:
+                    st.warning(f"SHAP local indisponible: {e}")
+            else:
+                if global_imp_df is not None:
+                    st.dataframe(global_imp_df.head(10))
+                else:
+                    st.info("Importance globale indisponible.")
+
+    st.divider()
+    # -------- Export PDF ----------
+    st.subheader("📄 Export")
+    if not REPORTLAB_AVAILABLE:
+        st.warning("Le module **reportlab** n'est pas installé. `pip install reportlab` puis relancez l'app.")
+    else:
+        try:
+            client_id_str = str(selected_id) if selected_id is not None else "NA"
+            pdf_bytes = build_client_report_pdf(
+                client_id=client_id_str,
+                model_name=f"{source_label}",
+                threshold=float(threshold),
+                proba=proba,
+                x_row=x_row,
+                X=X,
+                pool_df=pool_df,
+                global_imp_df=global_imp_df,
+                shap_vals=(shap_df if shap_df is not None and not shap_df.empty else None),
+            )
+            filename = f"fiche_client_{client_id_str}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+            st.download_button(
+                label="📄 Exporter la fiche client (PDF)",
+                data=pdf_bytes,
+                file_name=filename,
+                mime="application/pdf",
+                use_container_width=True
+            )
+        except Exception as e:
+            st.error(f"Échec de la génération du PDF : {e}")
+
+# -------------------------------
+# Tab 2 — Fiche client
+# -------------------------------
+with main_tabs[1]:
+    st.subheader("Fiche client")
+    if x_row.empty:
+        st.info("Sélectionnez un client dans la barre latérale.")
+    else:
+        if global_imp_df is not None:
+            key_feats = [f for f in global_imp_df.head(20)["feature"].tolist() if f in X.columns]
+        else:
+            key_feats = list(X.columns)[:20]
+        pretty = x_row[key_feats].T.reset_index()
+        pretty.columns = ["Variable", "Valeur"]
+        st.dataframe(pretty, use_container_width=True)
+
+# -------------------------------
+# Tab 3 — Comparaison
+# -------------------------------
+with main_tabs[2]:
+    st.subheader("Comparaison du client")
+    if X.empty:
+        st.info("Données indisponibles pour la comparaison.")
+    else:
+        st.markdown("**Définir le groupe de comparaison**")
+        candidate_cohorts = [c for c in [
+            "CODE_GENDER", "NAME_EDUCATION_TYPE", "NAME_INCOME_TYPE", "ORGANIZATION_TYPE",
+            "REGION_RATING_CLIENT", "FLAG_OWN_CAR", "FLAG_OWN_REALTY"
+        ] if c in pool_df.columns]
+        default_coh = [c for c in candidate_cohorts[:2]]
+        selected_cohorts = st.multiselect("Filtrer par attributs (cohorte similaire)", candidate_cohorts, default=default_coh)
+        cohort_df = pool_df.copy()
+        for c in selected_cohorts:
+            cohort_df = cohort_df[cohort_df[c] == pool_df.loc[pool_df[ID_COL] == selected_id, c].iloc[0]]
+        st.caption(f"Taille de la cohorte similaire : **{len(cohort_df):,}**")
+
+        if global_imp_df is not None and not global_imp_df.empty:
+            cand = [f for f in global_imp_df["feature"].tolist() if (f in X.columns or f in pool_df.columns)]
+        else:
+            cand = [f for f in list(X.columns) if (f in X.columns or f in pool_df.columns)]
+
+        comp_feats = []
+        for f in cand:
+            if get_quantile_series(f, pool_df, X) is not None:
+                comp_feats.append(f)
+            if len(comp_feats) >= 8:
+                break
+
+        if not comp_feats:
+            st.info("Aucune variable numérique comparable disponible.")
+        else:
+            long_rows = []
+            for f in comp_feats:
+                s_pop = get_quantile_series(f, pool_df, X)
+                if s_pop is None or s_pop.dropna().empty:
+                    continue
+                s_coh = get_cohort_series(f, cohort_df, X, ID_COL)
+                client_val = float(x_row[f].iloc[0]) if f in X.columns and pd.notnull(x_row[f].iloc[0]) else np.nan
+
+                pop_q = s_pop.quantile([0.1, 0.5, 0.9]).values
+                if s_coh is not None and not s_coh.dropna().empty:
+                    coh_q = s_coh.quantile([0.1, 0.5, 0.9]).values
+                else:
+                    coh_q = [np.nan, np.nan, np.nan]
+
+                long_rows += [
+                    {"feature": f, "group": "Population", "p10": pop_q[0], "p50": pop_q[1], "p90": pop_q[2], "client": client_val},
+                    {"feature": f, "group": "Cohorte similaire", "p10": coh_q[0], "p50": coh_q[1], "p90": coh_q[2], "client": client_val},
+                ]
+
+            if not long_rows:
+                st.info("Aucune variable numérique comparable disponible dans vos données.")
+            else:
+                long_df = pd.DataFrame(long_rows)
+                for grp in ["Population", "Cohorte similaire"]:
+                    sub = long_df[long_df.group == grp]
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(x=sub["p10"], y=sub["feature"], mode="markers", name="P10"))
+                    fig.add_trace(go.Scatter(x=sub["p50"], y=sub["feature"], mode="markers", name="P50"))
+                    fig.add_trace(go.Scatter(x=sub["p90"], y=sub["feature"], mode="markers", name="P90"))
+                    fig.add_trace(go.Scatter(x=sub["client"], y=sub["feature"], mode="markers", name="Client", marker=dict(symbol="diamond", size=12)))
+                    fig.update_layout(title=f"{grp} — Positionnement du client (P10/P50/P90)", height=400)
+                    st.plotly_chart(fig, use_container_width=True)
+
+# -------------------------------
+# Tab 4 — Insights globaux
+# -------------------------------
+with main_tabs[3]:
+    st.subheader("Importance globale & calibration")
+    if global_imp_df is not None:
+        fig_imp = px.bar(global_imp_df.head(20), x="importance", y="feature", orientation="h", title="Top 20 — Importance globale")
+        st.plotly_chart(fig_imp, use_container_width=True)
+    else:
+        st.info("Importance globale non fournie (`global_importance.csv`).")
+    figs = [
+        _pick_first_existing(["__results___14_1.png", "calibration.png"]),
+        _pick_first_existing(["__results___8_0.png", "target_balance.png"]),
+    ]
+    for p in figs:
+        if p:
+            st.image(p, use_container_width=True)
+
+# -------------------------------
+# Tab 5 — Qualité des données
+# -------------------------------
+with main_tabs[4]:
+    st.subheader("Qualité des données & valeurs manquantes")
+    miss_fig = _pick_first_existing(["__results___5_1.png", "missing_train.png"])
+    if miss_fig:
+        st.image(miss_fig, caption="Top taux de valeurs manquantes (train)", use_container_width=True)
+    else:
+        st.info("Figure de valeurs manquantes non trouvée.")
+    st.markdown("""
+    **Notes**
+    - Variables avec >70% de valeurs manquantes nécessitent une attention particulière.
+    - Considérer la suppression, l'imputation ciblée ou des modèles robustes au manquant (ex. CatBoost).
+    """)
+
+# -------------------------------
+# Tab 6 — Nouveau client (what-if)
+# -------------------------------
+with main_tabs[5]:
+    st.subheader("Comparer un nouveau client (what-if)")
+    st.markdown("Chargez un **CSV** (1 ligne) ou saisissez quelques variables clés pour simuler un nouveau client.")
+    up = st.file_uploader("Fichier CSV (1 ligne)", type=["csv"], accept_multiple_files=False)
+    topk = st.slider("Nombre de variables clés à saisir (importance globale)", min_value=5, max_value=40, value=15, step=1)
+    manual = st.checkbox("Saisie manuelle des variables clés", value=False)
+
+    new_x = None
+    if up is not None:
+        try:
+            df_new = pd.read_csv(up)
+            if len(df_new) != 1:
+                st.error("Le CSV doit contenir **exactement 1 ligne**.")
+            else:
+                new_x = df_new
+        except Exception as e:
+            st.error(f"Impossible de lire le CSV : {e}")
+
+    if manual and new_x is None:
+        if global_imp_df is not None and not global_imp_df.empty:
+            keys = [f for f in global_imp_df["feature"].tolist() if f in X.columns][:topk]
+        else:
+            keys = list(X.columns)[:topk]
+        num_cand = [f for f in keys if pd.api.types.is_numeric_dtype(X[f])]
+        cat_cand = [f for f in keys if f not in num_cand]
+
+        st.markdown("**Saisie manuelle** — valeurs par défaut = médiane (num) / modalité la plus fréquente (cat)")
+        cols = st.columns(2)
+        inputs: Dict[str, Any] = {}
+        with cols[0]:
+            for f in num_cand:
+                series = X[f]
+                default = float(np.nanmedian(series.values)) if np.isfinite(np.nanmedian(series.values)) else 0.0
+                inputs[f] = st.number_input(f, value=float(default))
+        with cols[1]:
+            for f in cat_cand:
+                series = pd.Series(X[f].dropna().astype(str))
+                mode = series.mode().iloc[0] if not series.empty else "NA"
+                opts = sorted(series.unique().tolist()[:50]) or ["NA"]
+                inputs[f] = st.selectbox(f, options=opts, index=(opts.index(mode) if mode in opts else 0))
+
+        if st.button("Simuler"):
+            new_x = pd.DataFrame([inputs])
+
+    if new_x is not None:
+        exp_cols = list(X.columns)
+        for c in exp_cols:
+            if c not in new_x.columns:
+                new_x[c] = np.nan
+        new_x = new_x[exp_cols]
+
+        if mode == "API FastAPI":
+            if not api_base or not api_ok:
+                st.error("API indisponible pour scorer le nouveau client.")
+            else:
+                try:
+                    payload = {
+                        "features": {k: (None if pd.isna(v) else v) for k, v in new_x.iloc[0].to_dict().items()},
+                        "threshold": float(threshold), "shap": True, "topk": 10
+                    }
+                    resp = api_predict(api_base, payload)
+                    new_p = float(resp["proba_default"])
+                    shap_rows = resp.get("top_contrib") or []
+                    if shap_rows:
+                        shap_df2 = pd.DataFrame([{
+                            "feature": r["feature"],
+                            "shap_value": float(r["shap_value"]),
+                            "abs_val": abs(float(r["shap_value"])),
+                            "value": r["value"],
+                        } for r in shap_rows])
+                    else:
+                        shap_df2 = None
+                except Exception as e:
+                    st.error(f"API KO: {e}")
+                    new_p, shap_df2 = None, None
+        else:
+            if model_local is None:
+                st.error("Modèle local indisponible.")
+                new_p, shap_df2 = None, None
+            else:
+                try:
+                    new_p = float(model_local.predict_proba(new_x)[0, 1])
+                    try:
+                        vals, _ = compute_local_shap(model_local, background, new_x)
+                        shap_df2 = pd.DataFrame({
+                            "feature": list(X.columns),
+                            "shap_value": vals,
+                            "abs_val": np.abs(vals),
+                            "value": new_x.iloc[0].values,
+                        }).sort_values("abs_val", ascending=False).head(10)
+                    except Exception:
+                        shap_df2 = None
+                except Exception as e:
+                    st.error(f"Échec de la prédiction: {e}")
+                    new_p, shap_df2 = None, None
+
+        if new_p is not None:
+            def _band(p: float):
+                if p < 0.05: return ("Faible", "#3CB371")
+                if p < 0.15: return ("Modérée", "#E6B800")
+                return ("Élevée", "#E74C3C")
+            band2, color2 = _band(new_p)
+            fig = go.Figure(go.Indicator(
+                mode="gauge+number",
+                value=new_p * 100,
+                number={"suffix": "%"},
+                gauge={"axis": {"range": [0, 100]}, "bar": {"color": color2}},
+                title={"text": f"Probabilité de défaut (nouveau client) — {mode.split()[0]}"},
+            ))
+            st.plotly_chart(fig, use_container_width=True)
+            if shap_df2 is not None and not shap_df2.empty:
+                st.markdown("**Contributions locales (SHAP)** — top 10")
+                st.plotly_chart(px.bar(shap_df2[::-1].head(10), x="shap_value", y="feature", orientation="h"), use_container_width=True)
+
+# -------------------------------
+# Tab 7 — Seuil & coût métier
+# -------------------------------
+with main_tabs[6]:
+    st.subheader("Seuil & coût métier (optimisation)")
+    if mode == "API FastAPI":
+        st.info("ℹ️ Cette section nécessite du **scoring de masse** (courbes ROC/PR, balayage du seuil). "
+                "Elle n'est **pas disponible** en mode API simplifié. Bascule en **mode Local** pour l’utiliser.")
+    else:
+        model
