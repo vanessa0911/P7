@@ -1,4 +1,4 @@
-# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v0.8.3)
+# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v0.8.4)
 # ----------------------------------------------------------------
 # Run:
 #   python -m streamlit run dashboard_streamlit_app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true
@@ -14,7 +14,7 @@
 # - Global importance (optional): global_importance.csv
 # - Interpretability (optional): interpretability_summary.json
 
-APP_VERSION = "0.8.3"
+APP_VERSION = "0.8.4"
 
 import os
 import json
@@ -28,7 +28,6 @@ import numpy as np
 import pandas as pd
 import joblib
 import shap
-import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 import requests
@@ -525,13 +524,13 @@ with main_tabs[0]:
     with col1:
         fig = go.Figure(go.Indicator(
             mode="gauge+number",
-            value=proba * 100,
+            value=float(proba) * 100.0,
             number={"suffix": "%"},
             gauge={"axis": {"range": [0, 100]},
                    "bar": {"color": color},
                    "steps": [
-                       {"range": [0, threshold * 100], "color": "#ecf8f3"},
-                       {"range": [threshold * 100, 100], "color": "#fdecea"},
+                       {"range": [0, float(threshold) * 100.0], "color": "#ecf8f3"},
+                       {"range": [float(threshold) * 100.0, 100], "color": "#fdecea"},
                    ]},
             title={"text": "Probabilité de défaut"},
         ))
@@ -542,11 +541,18 @@ with main_tabs[0]:
 
     with col2:
         st.markdown("**Contributions locales (Top 10)**")
+        def _bar_from_df(df: pd.DataFrame, title: str) -> go.Figure:
+            tmp = df.copy()
+            tmp = tmp.sort_values("abs_val").tail(10)
+            x_vals = np.asarray(tmp["shap_value"].values, dtype=float)
+            y_vals = tmp["feature"].astype(str).tolist()
+            hover = [f"valeur: {v}" for v in tmp["value"]]
+            figb = go.Figure(go.Bar(x=x_vals, y=y_vals, orientation="h", hovertext=hover, hoverinfo="text+x+y"))
+            figb.update_layout(title=title)
+            return figb
+
         if mode == "API FastAPI" and shap_df is not None and not shap_df.empty:
-            bar = px.bar(shap_df.sort_values("abs_val").tail(10), x="shap_value", y="feature", orientation="h",
-                         hover_data={"value": True, "abs_val": False},
-                         title="Impact sur le score (positif = ↑ risque)")
-            st.plotly_chart(bar, use_container_width=True)
+            st.plotly_chart(_bar_from_df(shap_df, "Impact sur le score (positif = ↑ risque)"), use_container_width=True)
         else:
             shap_enabled = st.toggle("Activer SHAP local (expérimental)", value=False,
                                      help="Explication locale côté dashboard (peut être lent).")
@@ -559,15 +565,19 @@ with main_tabs[0]:
                         "abs_val": np.abs(vals),
                         "value": x_row.iloc[0].values,
                     }).sort_values("abs_val", ascending=False)
-                    bar = px.bar(shap_df_local.head(10)[::-1], x="shap_value", y="feature", orientation="h",
-                                 hover_data={"value": True, "abs_val": False},
-                                 title="Impact sur le score (positif = ↑ risque)")
-                    st.plotly_chart(bar, use_container_width=True)
+                    st.plotly_chart(_bar_from_df(shap_df_local, "Impact sur le score (positif = ↑ risque)"),
+                                    use_container_width=True)
                 except Exception as e:
                     st.warning(f"SHAP local indisponible: {e}")
             else:
-                if global_imp_df is not None:
-                    st.dataframe(global_imp_df.head(10))
+                if global_imp_df is not None and not global_imp_df.empty:
+                    # Bar horizontale "importance globale"
+                    tmp = global_imp_df.head(10).copy()
+                    x_vals = np.asarray(tmp["importance"].values, dtype=float)
+                    y_vals = tmp["feature"].astype(str).tolist()
+                    figb = go.Figure(go.Bar(x=x_vals, y=y_vals, orientation="h"))
+                    figb.update_layout(title="Top 10 — Importance globale")
+                    st.plotly_chart(figb, use_container_width=True)
                 else:
                     st.info("Importance globale indisponible.")
 
@@ -677,21 +687,32 @@ with main_tabs[2]:
                 long_df = pd.DataFrame(long_rows)
                 for grp in ["Population", "Cohorte similaire"]:
                     sub = long_df[long_df.group == grp]
-                    fig = go.Figure()
-                    fig.add_trace(go.Scatter(x=sub["p10"], y=sub["feature"], mode="markers", name="P10"))
-                    fig.add_trace(go.Scatter(x=sub["p50"], y=sub["feature"], mode="markers", name="P50"))
-                    fig.add_trace(go.Scatter(x=sub["p90"], y=sub["feature"], mode="markers", name="P90"))
-                    fig.add_trace(go.Scatter(x=sub["client"], y=sub["feature"], mode="markers", name="Client", marker=dict(symbol="diamond", size=12)))
-                    fig.update_layout(title=f"{grp} — Positionnement du client (P10/P50/P90)", height=400)
-                    st.plotly_chart(fig, use_container_width=True)
+                    x_p10 = np.asarray(sub["p10"].values, dtype=float)
+                    x_p50 = np.asarray(sub["p50"].values, dtype=float)
+                    x_p90 = np.asarray(sub["p90"].values, dtype=float)
+                    x_cli = np.asarray(sub["client"].values, dtype=float)
+                    y_feat = sub["feature"].astype(str).tolist()
+
+                    figc = go.Figure()
+                    figc.add_trace(go.Scatter(x=x_p10, y=y_feat, mode="markers", name="P10"))
+                    figc.add_trace(go.Scatter(x=x_p50, y=y_feat, mode="markers", name="P50"))
+                    figc.add_trace(go.Scatter(x=x_p90, y=y_feat, mode="markers", name="P90"))
+                    figc.add_trace(go.Scatter(x=x_cli, y=y_feat, mode="markers", name="Client",
+                                              marker=dict(symbol="diamond", size=12)))
+                    figc.update_layout(title=f"{grp} — Positionnement du client (P10/P50/P90)", height=400)
+                    st.plotly_chart(figc, use_container_width=True)
 
 # -------------------------------
 # Tab 4 — Insights globaux
 # -------------------------------
 with main_tabs[3]:
     st.subheader("Importance globale & calibration")
-    if global_imp_df is not None:
-        fig_imp = px.bar(global_imp_df.head(20), x="importance", y="feature", orientation="h", title="Top 20 — Importance globale")
+    if global_imp_df is not None and not global_imp_df.empty:
+        tmp = global_imp_df.head(20).copy()
+        x_vals = np.asarray(tmp["importance"].values, dtype=float)
+        y_vals = tmp["feature"].astype(str).tolist()
+        fig_imp = go.Figure(go.Bar(x=x_vals, y=y_vals, orientation="h"))
+        fig_imp.update_layout(title="Top 20 — Importance globale")
         st.plotly_chart(fig_imp, use_container_width=True)
     else:
         st.info("Importance globale non fournie (`global_importance.csv`).")
@@ -701,7 +722,7 @@ with main_tabs[3]:
     ]
     for p in figs:
         if p:
-            st.image(p, use_container_width=True)
+            st.image(p, use_column_width=True)
 
 # -------------------------------
 # Tab 5 — Qualité des données
@@ -824,17 +845,22 @@ with main_tabs[5]:
                 if p < 0.15: return ("Modérée", "#E6B800")
                 return ("Élevée", "#E74C3C")
             band2, color2 = _band(new_p)
-            fig = go.Figure(go.Indicator(
+            fign = go.Figure(go.Indicator(
                 mode="gauge+number",
-                value=new_p * 100,
+                value=float(new_p) * 100.0,
                 number={"suffix": "%"},
                 gauge={"axis": {"range": [0, 100]}, "bar": {"color": color2}},
                 title={"text": f"Probabilité de défaut (nouveau client) — {mode.split()[0]}"},
             ))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fign, use_container_width=True)
             if shap_df2 is not None and not shap_df2.empty:
-                st.markdown("**Contributions locales (SHAP)** — top 10")
-                st.plotly_chart(px.bar(shap_df2[::-1].head(10), x="shap_value", y="feature", orientation="h"), use_container_width=True)
+                tmp = shap_df2.copy()
+                tmp = tmp.sort_values("abs_val").tail(10)
+                x_vals = np.asarray(tmp["shap_value"].values, dtype=float)
+                y_vals = tmp["feature"].astype(str).tolist()
+                figb2 = go.Figure(go.Bar(x=x_vals, y=y_vals, orientation="h"))
+                figb2.update_layout(title="Contributions locales (SHAP) — top 10")
+                st.plotly_chart(figb2, use_container_width=True)
 
 # -------------------------------
 # Tab 7 — Seuil & coût métier
@@ -845,7 +871,6 @@ with main_tabs[6]:
         st.info("ℹ️ Cette section nécessite du **scoring de masse** (courbes ROC/PR, balayage du seuil). "
                 "Elle n'est **pas disponible** en mode API simplifié. Bascule en **mode Local** pour l’utiliser.")
     else:
-        # >>> correction: on n'utilise plus une variable globale 'model', mais 'mdl_local'
         mdl_local = model_local
         if mdl_local is None or X.empty or TARGET_COL is None:
             st.info("Pour optimiser le seuil, il faut : un **modèle local**, des **données** et la colonne **TARGET**.")
@@ -891,8 +916,12 @@ with main_tabs[6]:
                     try:
                         fpr, tpr, roc_th = roc_curve(y_all.values, p_all)
                         fig_roc = go.Figure()
-                        fig_roc.add_trace(go.Scatter(x=fpr, y=tpr, mode="lines", name=f"ROC (AUC={auc:.3f})"))
-                        fig_roc.add_trace(go.Scatter(x=[0,1], y=[0,1], mode="lines", name="Random", line=dict(dash="dash")))
+                        fig_roc.add_trace(go.Scatter(x=np.asarray(fpr, dtype=float),
+                                                     y=np.asarray(tpr, dtype=float),
+                                                     mode="lines", name=f"ROC (AUC={auc:.3f})"))
+                        fig_roc.add_trace(go.Scatter(x=np.asarray([0,1], dtype=float),
+                                                     y=np.asarray([0,1], dtype=float),
+                                                     mode="lines", name="Random", line=dict(dash="dash")))
                         fig_roc.update_layout(title="Courbe ROC", xaxis_title="FPR", yaxis_title="TPR", height=350)
                         st.plotly_chart(fig_roc, use_container_width=True)
                     except Exception:
@@ -901,7 +930,9 @@ with main_tabs[6]:
                     try:
                         prec, rec, pr_th = precision_recall_curve(y_all.values, p_all)
                         fig_pr = go.Figure()
-                        fig_pr.add_trace(go.Scatter(x=rec, y=prec, mode="lines", name="Precision-Recall"))
+                        fig_pr.add_trace(go.Scatter(x=np.asarray(rec, dtype=float),
+                                                    y=np.asarray(prec, dtype=float),
+                                                    mode="lines", name="Precision-Recall"))
                         fig_pr.update_layout(title="Précision–Rappel", xaxis_title="Recall", yaxis_title="Precision", height=350)
                         st.plotly_chart(fig_pr, use_container_width=True)
                     except Exception:
@@ -909,7 +940,9 @@ with main_tabs[6]:
 
                     df_cost, best = cost_curve(y_all.values, p_all, cost_fp, cost_fn, step=0.001)
                     fig_cost = go.Figure()
-                    fig_cost.add_trace(go.Scatter(x=df_cost["threshold"], y=df_cost["cost"], mode="lines", name="Coût total"))
+                    fig_cost.add_trace(go.Scatter(x=np.asarray(df_cost["threshold"].values, dtype=float),
+                                                  y=np.asarray(df_cost["cost"].values, dtype=float),
+                                                  mode="lines", name="Coût total"))
                     fig_cost.add_vline(x=float(best["threshold"]), line_width=2, line_dash="dash", line_color="green",
                                        annotation_text=f"Seuil optimal = {best['threshold']:.3f}",
                                        annotation_position="top left")
