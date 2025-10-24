@@ -1,16 +1,16 @@
-# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v0.5.0)
+# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v0.6.0)
 # ----------------------------------------------------------------
-# Run:  streamlit run dashboard_streamlit_app.py --server.address 0.0.0.0 --server.port 8501
-# One-file app (no folders required). Place artifacts at the repo root.
+# Run:
+#   python -m streamlit run dashboard_streamlit_app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true
 #
 # Root files auto-detected (first found wins):
 # - Data:  application_train_clean.csv  |  clients_demo.csv  |  clients_demo.parquet
 # - Model: model_calibrated_isotonic.joblib | model_calibrated_sigmoid.joblib | model_baseline_logreg.joblib
-# - Features: feature_names.npy (optional)
-# - Global importance: global_importance.csv (optional)
-# - Interpretability: interpretability_summary.json (optional)
+# - Features (optional): feature_names.npy
+# - Global importance (optional): global_importance.csv  (columns: feature, importance)
+# - Interpretability (optional): interpretability_summary.json
 
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.6.0"
 
 import os
 import json
@@ -49,9 +49,8 @@ def load_table(path: str) -> pd.DataFrame:
 def load_model(path: str):
     return joblib.load(path)
 
-# Safe loader that tells which dependency is missing (e.g. catboost)
-
 def safe_load_model(path: str):
+    """Loader avec message clair si une dépendance manque (ex. catboost)."""
     try:
         return load_model(path)
     except ModuleNotFoundError as e:
@@ -67,6 +66,7 @@ def load_feature_names(path: Optional[str], df_cols: List[str]) -> List[str]:
         arr = np.load(path, allow_pickle=True)
         names = list(arr.tolist())
         return [c for c in names if c in df_cols]
+    # fallback: toutes les colonnes brutes sauf ID/Target
     return [c for c in df_cols if c not in {"TARGET", "SK_ID_CURR"}]
 
 @st.cache_data(show_spinner=False)
@@ -88,9 +88,8 @@ def load_interpretability_summary(path: Optional[str]) -> dict:
             return json.load(f)
     return {}
 
-# Columns expected by the model's preprocessor (if any)
-
 def get_expected_input_columns(model) -> Optional[List[str]]:
+    """Colonnes d'entrée (brutes) attendues par le préprocesseur du modèle."""
     try:
         m = model
         if isinstance(m, SkPipeline):
@@ -103,8 +102,6 @@ def get_expected_input_columns(model) -> Optional[List[str]]:
         pass
     return None
 
-# Robust SHAP (model-agnostic) on the full pipeline predict_proba
-
 def compute_local_shap(estimator, X_background: pd.DataFrame, x_row: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     """
     Explication locale robuste, modèle-agnostique, sur la pipeline complète.
@@ -112,7 +109,7 @@ def compute_local_shap(estimator, X_background: pd.DataFrame, x_row: pd.DataFram
     """
     import shap, pandas as pd, numpy as np
 
-    # Limit background size to keep speed reasonable
+    # limiter le fond pour garder de bonnes perfs
     bg = X_background
     if len(bg) > 200:
         bg = bg.sample(200, random_state=42)
@@ -127,6 +124,41 @@ def compute_local_shap(estimator, X_background: pd.DataFrame, x_row: pd.DataFram
     ex = explainer(x_row)
     return np.array(ex.values).reshape(-1), np.array(ex.base_values).reshape(-1)
 
+# ---- quantiles robustes (évite les KeyError) ----
+
+def get_quantile_series(feature: str, pool_df: pd.DataFrame, X: pd.DataFrame) -> Optional[pd.Series]:
+    """
+    Série utilisée pour les quantiles :
+    - priorité au dataset brut pool_df si la colonne est présente et numérique
+    - sinon bascule sur X (colonnes alignées au modèle)
+    - sinon None
+    """
+    if feature in pool_df.columns and pd.api.types.is_numeric_dtype(pool_df[feature]):
+        return pool_df[feature]
+    if feature in X.columns and pd.api.types.is_numeric_dtype(X[feature]):
+        return X[feature]
+    return None
+
+def get_cohort_series(feature: str, cohort_df: pd.DataFrame, X: pd.DataFrame, ID_COL: Optional[str]) -> Optional[pd.Series]:
+    """
+    Série pour la cohorte (mêmes règles que ci-dessus). Si la colonne n’est pas dans cohort_df,
+    on la récupère via X en filtrant sur les IDs de la cohorte.
+    """
+    if feature in cohort_df.columns and pd.api.types.is_numeric_dtype(cohort_df[feature]):
+        return cohort_df[feature]
+    if ID_COL and ID_COL in cohort_df.columns and feature in X.columns:
+        idx = cohort_df[ID_COL].values
+        s = X.loc[X.index.intersection(idx), feature]
+        return s if pd.api.types.is_numeric_dtype(s) else None
+    return None
+
+def prob_to_band(p: float, low=0.05, high=0.15) -> Tuple[str, str]:
+    if p < low:
+        return ("Faible", "#3CB371")
+    if p < high:
+        return ("Modérée", "#E6B800")
+    return ("Élevée", "#E74C3C")
+
 # -------------------------------
 # Locate artifacts at repo root (no folders required)
 # -------------------------------
@@ -136,12 +168,12 @@ DATA_TRAIN = _pick_first_existing([
     "clients_demo.parquet",
 ])
 DATA_TEST  = _pick_first_existing(["application_test_clean.csv"])  # optional
-MODEL_ISO  = _pick_first_existing(["model_calibrated_isotonic.joblib"]) 
-MODEL_SIG  = _pick_first_existing(["model_calibrated_sigmoid.joblib"]) 
-MODEL_BASE = _pick_first_existing(["model_baseline_logreg.joblib"]) 
-FEATS_PATH = _pick_first_existing(["feature_names.npy"]) 
-GLOBIMP    = _pick_first_existing(["global_importance.csv"]) 
-INTERP_SUM = _pick_first_existing(["interpretability_summary.json"]) 
+MODEL_ISO  = _pick_first_existing(["model_calibrated_isotonic.joblib"])
+MODEL_SIG  = _pick_first_existing(["model_calibrated_sigmoid.joblib"])
+MODEL_BASE = _pick_first_existing(["model_baseline_logreg.joblib"])
+FEATS_PATH = _pick_first_existing(["feature_names.npy"])
+GLOBIMP    = _pick_first_existing(["global_importance.csv"])
+INTERP_SUM = _pick_first_existing(["interpretability_summary.json"])
 
 with st.sidebar:
     st.title("💳 Scoring Crédit — Dashboard")
@@ -196,10 +228,12 @@ if model_name in (model_paths or {}):
 if not pool_df.empty and selected_id is not None:
     df_idx = pool_df.set_index(ID_COL)
     temp_expected = get_expected_input_columns(model) or feature_names or list(df_idx.columns)
+    # Créer les colonnes manquantes à NaN et ordonner
     for c in temp_expected:
         if c not in df_idx.columns:
             df_idx[c] = np.nan
     X = df_idx[temp_expected]
+    # x_row + background (limité pour SHAP)
     x_row = X.loc[[selected_id]]
     background = X.sample(min(200, len(X)), random_state=42)
 else:
@@ -233,8 +267,7 @@ with main_tabs[0]:
     if proba is None:
         st.warning("Modèle ou données indisponibles pour calculer une probabilité.")
     else:
-        band = "Faible" if proba < 0.05 else ("Modérée" if proba < 0.15 else "Élevée")
-        color = {"Faible": "#3CB371", "Modérée": "#E6B800", "Élevée": "#E74C3C"}[band]
+        band, color = prob_to_band(proba)
         col1, col2 = st.columns([1, 2])
         with col1:
             fig = go.Figure(go.Indicator(
@@ -252,6 +285,7 @@ with main_tabs[0]:
             st.plotly_chart(fig, use_container_width=True)
             st.markdown(f"**Décision (seuil {threshold:.3f})** : **{'Refus' if proba >= threshold else 'Accord'}**")
             st.markdown(f"Risque : **{band}**")
+
         with col2:
             st.markdown("**Contributions locales (SHAP)** — top 10")
             shap_enabled = st.toggle("Activer SHAP (expérimental)", value=False,
@@ -266,8 +300,8 @@ with main_tabs[0]:
                         "value": x_row.iloc[0].values,
                     }).sort_values("abs_val", ascending=False).head(10)
                     bar = px.bar(local_df[::-1], x="shap_value", y="feature", orientation="h",
-                                  hover_data={"value": True, "abs_val": False},
-                                  title="Impact sur le score (positif = ↑ risque)")
+                                 hover_data={"value": True, "abs_val": False},
+                                 title="Impact sur le score (positif = ↑ risque)")
                     st.plotly_chart(bar, use_container_width=True)
                 except Exception as e:
                     st.warning(f"SHAP indisponible: {e}")
@@ -312,28 +346,44 @@ with main_tabs[2]:
             cohort_df = cohort_df[cohort_df[c] == pool_df.loc[pool_df[ID_COL] == selected_id, c].iloc[0]]
         st.caption(f"Taille de la cohorte similaire : **{len(cohort_df):,}**")
 
+        # Candidats depuis l'importance globale ou les colonnes du modèle
         if global_imp_df is not None and not global_imp_df.empty:
-            cand = [f for f in global_imp_df["feature"].tolist() if f in X.columns and f in pool_df.columns]
+            cand = [f for f in global_imp_df["feature"].tolist() if (f in X.columns or f in pool_df.columns)]
         else:
-            cand = [f for f in list(X.columns) if f in pool_df.columns]
-        comp_feats = [f for f in cand if pd.api.types.is_numeric_dtype(pool_df[f])][:8]
+            cand = [f for f in list(X.columns) if (f in X.columns or f in pool_df.columns)]
+
+        # On garde celles pour lesquelles on a AU MOINS une série numérique valide (pool_df ou X)
+        comp_feats = []
+        for f in cand:
+            if get_quantile_series(f, pool_df, X) is not None:
+                comp_feats.append(f)
+            if len(comp_feats) >= 8:
+                break
 
         if not comp_feats:
-            st.info("Pas de variables numériques à comparer.")
+            st.info("Aucune variable numérique comparable disponible.")
         else:
             long_rows = []
             for f in comp_feats:
-                if f not in pool_df.columns or not pd.api.types.is_numeric_dtype(pool_df[f]):
+                s_pop = get_quantile_series(f, pool_df, X)
+                if s_pop is None or s_pop.dropna().empty:
                     continue
-                client_val = float(x_row[f].iloc[0]) if pd.notnull(x_row[f].iloc[0]) else np.nan
-                pop_q = pool_df[f].quantile([0.1, 0.5, 0.9]).values
-                coh_q = cohort_df[f].quantile([0.1, 0.5, 0.9]).values if len(cohort_df) > 1 else [np.nan, np.nan, np.nan]
+                s_coh = get_cohort_series(f, cohort_df, X, ID_COL)
+                client_val = float(x_row[f].iloc[0]) if f in X.columns and pd.notnull(x_row[f].iloc[0]) else np.nan
+
+                pop_q = s_pop.quantile([0.1, 0.5, 0.9]).values
+                if s_coh is not None and not s_coh.dropna().empty:
+                    coh_q = s_coh.quantile([0.1, 0.5, 0.9]).values
+                else:
+                    coh_q = [np.nan, np.nan, np.nan]
+
                 long_rows += [
                     {"feature": f, "group": "Population", "p10": pop_q[0], "p50": pop_q[1], "p90": pop_q[2], "client": client_val},
                     {"feature": f, "group": "Cohorte similaire", "p10": coh_q[0], "p50": coh_q[1], "p90": coh_q[2], "client": client_val},
                 ]
+
             if not long_rows:
-                st.info("Aucune variable numérique comparable disponible dans le dataset brut.")
+                st.info("Aucune variable numérique comparable disponible dans vos données.")
             else:
                 long_df = pd.DataFrame(long_rows)
                 for grp in ["Population", "Cohorte similaire"]:
@@ -385,7 +435,7 @@ with main_tabs[4]:
 # Tab 6 — Nouveau client (what-if)
 # -------------------------------
 with main_tabs[5]:
-    st.subheader("Comparer un nouveau client (what‑if)")
+    st.subheader("Comparer un nouveau client (what-if)")
     if model is None or X.empty:
         st.info("Modèle ou données indisponibles. Sélectionnez un modèle et chargez un dataset.")
     else:
@@ -453,8 +503,7 @@ with main_tabs[5]:
             new_x = new_x[exp_cols]
             try:
                 new_p = float(model.predict_proba(new_x)[0, 1])
-                band = "Faible" if new_p < 0.05 else ("Modérée" if new_p < 0.15 else "Élevée")
-                color = {"Faible": "#3CB371", "Modérée": "#E6B800", "Élevée": "#E74C3C"}[band]
+                band, color = prob_to_band(new_p)
                 fig = go.Figure(go.Indicator(
                     mode="gauge+number",
                     value=new_p * 100,
@@ -475,7 +524,7 @@ with main_tabs[5]:
                     st.plotly_chart(px.bar(ld[::-1], x="shap_value", y="feature", orientation="h"), use_container_width=True)
                 except Exception as e:
                     st.info(f"SHAP non disponible: {e}")
-                # quick comparison to population quantiles (use X to avoid missing raw columns)
+                # comparaison quantiles sur X (espace aligné)
                 if global_imp_df is not None and not global_imp_df.empty:
                     comp_feats = [f for f in global_imp_df.head(6)["feature"].tolist() if f in X.columns and pd.api.types.is_numeric_dtype(X[f])]
                 else:
