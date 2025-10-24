@@ -453,3 +453,4 @@ with left:
     st.caption("© Prêt à dépenser — Dashboard pédagogique. Ce tableau de bord vise la transparence et l'explicabilité des décisions d'octroi.")
 with right:
     st.caption("Build: Streamlit + SHAP + scikit-learn")
+ 
