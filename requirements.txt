@@ -14,3 +14,13 @@ requests>=2.31
 reportlab>=4.2.2
 plotly<6
 narwhals>=1.0.0
+fastapi>=0.115
+uvicorn>=0.30
+pydantic>=2.7
+reportlab>=4.2.2
+plotly<6
+numpy
+pandas
+scikit-learn
+joblib
+shap
