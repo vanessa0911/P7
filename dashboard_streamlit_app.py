@@ -140,15 +140,15 @@ def build_numeric_only_transformer(num_cols: List[str]):
 # Compute SHAP for a single row with a small background sample for speed
 @st.cache_data(show_spinner=False)
 def compute_local_shap(estimator, X_background: pd.DataFrame, x_row: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-    base_est = _unwrap_estimator(estimator)
-    # Choose explainer
-    explainer = None
-    try:
-        explainer = shap.TreeExplainer(base_est)
-    except Exception:
-        # Fallback generic
-        explainer = shap.Explainer(base_est, X_background, feature_names=list(X_background.columns))
-    # SHAP values for one row
+    """Model-agnostic SHAP using the full estimator as a black box.
+    Works with Pipelines/Calibrated models. Computes SHAP for the positive class.
+    """
+    # Define prediction function on DataFrame -> proba[:,1]
+    def f(Xdf):
+        if not isinstance(Xdf, pd.DataFrame):
+            Xdf = pd.DataFrame(Xdf, columns=list(X_background.columns))
+        return estimator.predict_proba(Xdf)[:, 1]
+    explainer = shap.Explainer(f, X_background, feature_names=list(X_background.columns))
     values = explainer(x_row)  # shap.Explanation
     return np.array(values.values).reshape(-1), np.array(values.base_values).reshape(-1)
 
@@ -295,7 +295,7 @@ if model is not None and not x_row.empty:
     proba = float(model.predict_proba(x_row)[0, 1])
 
 # Tabs
-main_tabs = st.tabs(["📈 Score & explication", "🧑‍💼 Fiche client", "⚖️ Comparaison", "🌍 Insights globaux", "🧪 Qualité des données"]) # Load selected model lazily to avoid importing heavy deps unless needed
+main_tabs = st.tabs(["📈 Score & explication", "🧑‍💼 Fiche client", "⚖️ Comparaison", "🌍 Insights globaux", "🧪 Qualité des données", "🆕 Nouveau client"]) # Load selected model lazily to avoid importing heavy deps unless needed
 model = None
 if model_name in (model_paths or {}):
     try:
@@ -316,7 +316,7 @@ if model is not None and not x_row.empty:
         proba = float(model.predict_proba(Xnum_row)[0, 1])
 
 # Tabs
-main_tabs = st.tabs(["📈 Score & explication", "🧑‍💼 Fiche client", "⚖️ Comparaison", "🌍 Insights globaux", "🧪 Qualité des données"])
+main_tabs = st.tabs(["📈 Score & explication", "🧑‍💼 Fiche client", "⚖️ Comparaison", "🌍 Insights globaux", "🧪 Qualité des données", "🆕 Nouveau client"])
 
 # -------------------------------
 # Tab 1 — Score & local explanation
@@ -491,6 +491,103 @@ with main_tabs[4]:
     - Variables avec >70% de valeurs manquantes nécessitent une attention particulière.
     - Considérer la suppression, l'imputation ciblée ou des modèles robustes au manquant (ex. CatBoost).
     """)
+
+# -------------------------------
+# Tab 6 — Nouveau client (what-if)
+# -------------------------------
+with main_tabs[5]:
+    st.subheader("Comparer un nouveau client (what‑if)")
+    if model is None or X.empty:
+        st.info("Modèle ou données indisponibles. Sélectionnez un modèle et chargez un dataset.")
+    else:
+        st.markdown("Chargez un **CSV** (1 ligne) ou saisissez quelques variables clés pour simuler un nouveau client.")
+        up = st.file_uploader("Fichier CSV (1 ligne)", type=["csv"], accept_multiple_files=False)
+        manual = st.checkbox("Saisie manuelle simplifiée", value=False)
+
+        new_x = None
+        if up is not None:
+            try:
+                df_new = pd.read_csv(up)
+                if len(df_new) != 1:
+                    st.error("Le CSV doit contenir **exactement 1 ligne**.")
+                else:
+                    new_x = df_new
+            except Exception as e:
+                st.error(f"Impossible de lire le CSV : {e}")
+
+        if manual and new_x is None:
+            # propose un petit set de features saisis à la main (top 10 num par importance)
+            if global_imp_df is not None:
+                cand = [f for f in global_imp_df["feature"].tolist() if f in X.columns]
+            else:
+                cand = list(X.columns)
+            num_cand = [f for f in cand if pd.api.types.is_numeric_dtype(X[f])][:10]
+            cat_cand = [f for f in cand if f not in num_cand][:5]
+
+            cols = st.columns(2)
+            inputs = {}
+            with cols[0]:
+                for f in num_cand:
+                    default = float(np.nanmedian(X[f].values)) if np.isfinite(np.nanmedian(X[f].values)) else 0.0
+                    inputs[f] = st.number_input(f, value=float(default))
+            with cols[1]:
+                for f in cat_cand:
+                    opts = sorted([str(x) for x in pd.Series(X[f].dropna().unique()).astype(str).tolist()][:50]) or ["NA"]
+                    inputs[f] = st.selectbox(f, options=opts)
+
+            if st.button("Simuler"):
+                new_x = pd.DataFrame([inputs])
+
+        if new_x is not None:
+            # Aligner aux colonnes attendues
+            exp_cols = list(X.columns)
+            for c in exp_cols:
+                if c not in new_x.columns:
+                    new_x[c] = np.nan
+            new_x = new_x[exp_cols]
+
+            try:
+                new_p = float(model.predict_proba(new_x)[0, 1])
+                band, color = prob_to_band(new_p)
+                fig = go.Figure(go.Indicator(
+                    mode="gauge+number",
+                    value=new_p * 100,
+                    number={"suffix": "%"},
+                    gauge={"axis": {"range": [0, 100]}, "bar": {"color": color}},
+                    title={"text": "Probabilité de défaut (nouveau client)"},
+                ))
+                st.plotly_chart(fig, use_container_width=True)
+
+                # SHAP local
+                try:
+                    vals, base_vals = compute_local_shap(model, background, new_x)
+                    ld = pd.DataFrame({"feature": list(X.columns), "shap_value": vals, "abs_val": np.abs(vals), "value": new_x.iloc[0].values})\
+                        .sort_values("abs_val", ascending=False).head(10)
+                    st.markdown("**Contributions locales (SHAP)** — top 10")
+                    st.plotly_chart(px.bar(ld[::-1], x="shap_value", y="feature", orientation="h"), use_container_width=True)
+                except Exception as e:
+                    st.info("SHAP non disponible pour ce modèle/format.")
+
+                # Comparaison de quelques features clés
+                if global_imp_df is not None:
+                    comp_feats = [f for f in global_imp_df.head(6)["feature"].tolist() if f in X.columns]
+                else:
+                    comp_feats = list(X.columns)[:6]
+                long_rows = []
+                for f in comp_feats:
+                    client_val = float(new_x[f].iloc[0]) if pd.notnull(new_x[f].iloc[0]) and pd.api.types.is_numeric_dtype(X[f]) else np.nan
+                    pop_q = X[f].quantile([0.1, 0.5, 0.9]).values if pd.api.types.is_numeric_dtype(X[f]) else [np.nan, np.nan, np.nan]
+                    long_rows.append({"feature": f, "group": "Population", "p10": pop_q[0], "p50": pop_q[1], "p90": pop_q[2], "client": client_val})
+                long_df = pd.DataFrame(long_rows)
+                figc = go.Figure()
+                figc.add_trace(go.Scatter(x=long_df["p10"], y=long_df["feature"], mode="markers", name="P10"))
+                figc.add_trace(go.Scatter(x=long_df["p50"], y=long_df["feature"], mode="markers", name="P50"))
+                figc.add_trace(go.Scatter(x=long_df["p90"], y=long_df["feature"], mode="markers", name="P90"))
+                figc.add_trace(go.Scatter(x=long_df["client"], y=long_df["feature"], mode="markers", name="Client", marker=dict(symbol="diamond", size=12)))
+                figc.update_layout(title="Positionnement du nouveau client (P10/P50/P90)", height=400)
+                st.plotly_chart(figc, use_container_width=True)
+            except Exception as e:
+                st.error(f"Échec de la prédiction: {e}")
 
 # Footer
 st.divider()
