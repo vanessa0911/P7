@@ -15,6 +15,23 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, JSONResponse
 from pydantic import BaseModel
+import json
+from sklearn.metrics import brier_score_loss
+
+DEFAULT_THRESHOLD = 0.67   # ton seuil métier actuel (metadata.json)
+DEFAULT_COST_FP   = 1.0
+DEFAULT_COST_FN   = 5.0
+
+
+def load_metadata(path: str = "metadata.json") -> dict:
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"[WARN] metadata.json load error: {e}")
+    return {}
+
 
 # ----------------- Utils chargement -----------------
 def _pick_first_existing(paths: List[str]) -> Optional[str]:
@@ -119,6 +136,13 @@ def decode_cats(df_num: pd.DataFrame) -> pd.DataFrame:
 # Background réduit pour SHAP
 _BG_BASE = X_all.sample(min(120, len(X_all)), random_state=42)
 
+
+META = load_metadata()
+DEFAULT_THRESHOLD = float(META.get("decision_threshold", {}).get("t_selected") or 0.67)
+DEFAULT_COST_FP   = float(META.get("decision_threshold", {}).get("c_fp") or 1.0)
+DEFAULT_COST_FN   = float(META.get("decision_threshold", {}).get("c_fn") or 5.0)
+CHAMPION_ALGO     = META.get("champion_algo") or META.get("chosen_model") or "unknown"
+
 # ----------------- Métriques & coût -----------------
 from sklearn.metrics import (
     precision_recall_curve, roc_curve, roc_auc_score, confusion_matrix,
@@ -166,20 +190,27 @@ def root():
 class PredictBody(BaseModel):
     client_id: Optional[int | str] = None
     features: Optional[Dict[str, Any]] = None
-    threshold: Optional[float] = 0.08
+    threshold: Optional[float] = DEFAULT_THRESHOLD  
     shap: Optional[bool] = True
     topk: Optional[int] = 10
-    bg_max: Optional[int] = 80  # background SHAP max
+    bg_max: Optional[int] = 80
 
 class MetricsBody(BaseModel):
-    cost_fp: float = 100.0
-    cost_fn: float = 1000.0
+    cost_fp: float = DEFAULT_COST_FP       
+    cost_fn: float = DEFAULT_COST_FN       
     max_sample: int = 20000
     step: float = 0.001
+    threshold: Optional[float] = None
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": os.path.basename(model_path), "rows": int(len(X_all))}
+    return {
+        "status": "ok",
+        "model": os.path.basename(model_path),
+        "algo": CHAMPION_ALGO,
+        "threshold_default": DEFAULT_THRESHOLD,
+        "rows": int(len(X_all))
+    }
 
 @app.get("/sample_ids")
 def sample_ids(n: int = 5):
@@ -289,46 +320,109 @@ def predict(body: PredictBody):
 
 @app.post("/metrics")
 def metrics(body: MetricsBody):
+    """
+    Renvoie:
+      - auc, brier
+      - roc: fpr/tpr
+      - pr: precision/recall
+      - cost_curve: (threshold[], cost[], best={...})
+      - current: métriques au seuil courant (payload.threshold ou DEFAULT_THRESHOLD)
+      - defaults: seuil & coûts par défaut (metadata.json)
+      - n_scored: lignes scorées
+    """
+    from fastapi import HTTPException
+    from sklearn.metrics import brier_score_loss, roc_auc_score, roc_curve, precision_recall_curve
+    import numpy as np
+    import pandas as pd
+
+    # 1) Vérifs données/labels
     if TARGET_COL is None or TARGET_COL not in pool_df.columns:
         raise HTTPException(status_code=400, detail="TARGET manquant dans les données serveur.")
     df_lab = pool_df.dropna(subset=[TARGET_COL]).copy()
     if df_lab.empty:
         raise HTTPException(status_code=400, detail="Aucune ligne labellisée.")
     df_lab = df_lab.set_index(ID_COL)
+
+    # 2) Aligner les colonnes attendues par le modèle
     for c in expected_cols:
         if c not in df_lab.columns:
             df_lab[c] = np.nan
     X = df_lab[expected_cols]
     y = df_lab[TARGET_COL].astype(int)
 
-    if len(X) > int(body.max_sample):
-        X = X.sample(int(body.max_sample), random_state=42)
+    # 3) Échantillonnage si demandé
+    max_sample = int(getattr(body, "max_sample", 20000))
+    if len(X) > max_sample:
+        X = X.sample(max_sample, random_state=42)
         y = y.loc[X.index]
 
+    # 4) Scores de proba
     try:
         p = model.predict_proba(X)[:, 1]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erreur scoring masse: {e}")
 
-    # AUC, ROC, PR
+    # 5) Métriques globales
     try:
         auc = float(roc_auc_score(y.values, p))
     except Exception:
         auc = float("nan")
+
     try:
         fpr, tpr, _ = roc_curve(y.values, p)
         fpr, tpr = fpr.tolist(), tpr.tolist()
     except Exception:
         fpr, tpr = [], []
+
     try:
         prec, rec, _ = precision_recall_curve(y.values, p)
         prec, rec = prec.tolist(), rec.tolist()
     except Exception:
         prec, rec = [], []
 
-    # Courbe de coût
-    df_cost, best = cost_curve(y.values, p, float(body.cost_fp), float(body.cost_fn), float(body.step))
+    try:
+        brier = float(brier_score_loss(y.values, p))
+    except Exception:
+        brier = float("nan")
+
+    # 6) Courbe de coût + "best"
+    cost_fp = float(getattr(body, "cost_fp", DEFAULT_COST_FP))
+    cost_fn = float(getattr(body, "cost_fn", DEFAULT_COST_FN))
+    step = float(getattr(body, "step", 0.001))
+    if step <= 0:
+        step = 0.001
+
+    df_cost, best = cost_curve(y.values, p, cost_fp, cost_fn, step)
+
+    # 7) Bloc "current" (au seuil courant: payload.threshold ou DEFAULT_THRESHOLD)
+    cur_t = getattr(body, "threshold", None)
+    cur_t = float(cur_t) if cur_t is not None else float(DEFAULT_THRESHOLD)
+    cur = cost_at_threshold(y.values, p, cur_t, cost_fp, cost_fn)
+    cur["threshold"] = cur_t
+
+    # 8) Réponse JSON (listes/float natifs)
+    out_best = {k: (float(v) if isinstance(v, (int, float, np.floating)) else v) for k, v in best.items()}
+    out_cur = {k: (float(v) if isinstance(v, (int, float, np.floating)) else v) for k, v in cur.items()}
+
     return {
+        "auc": auc,
+        "brier": brier,
+        "roc": {"fpr": fpr, "tpr": tpr},
+        "pr": {"precision": prec, "recall": rec},
+        "cost_curve": {
+            "threshold": df_cost["threshold"].astype(float).tolist(),
+            "cost": df_cost["cost"].astype(float).tolist(),
+            "best": out_best,
+        },
+        "current": out_cur,
+        "defaults": {
+            "threshold": float(DEFAULT_THRESHOLD),
+            "cost_fp": float(DEFAULT_COST_FP),
+            "cost_fn": float(DEFAULT_COST_FN),
+        },
+        "n_scored": int(len(X)),
+    }
+ {
         "auc": auc,
         "roc": {"fpr": fpr, "tpr": tpr},
         "pr": {"precision": prec, "recall": rec},
