@@ -22,6 +22,4 @@ scikit-learn
 numpy==1.26.4
 scipy==1.11.4
 shap==0.44.1
-docker build -f Dockerfile.api -t credit-api:latest .
-docker run --rm -p 8000:8000 credit-api:latest
 
