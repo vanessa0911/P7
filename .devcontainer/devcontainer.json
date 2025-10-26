@@ -1,0 +1,5 @@
+{
+  "name": "P7",
+  "build": { "dockerfile": "Dockerfile" },
+  "forwardPorts": [8501, 8000]
+}
