@@ -1,9 +1,9 @@
-# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v1.2.2)
+# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v1.3.0)
 # ----------------------------------------------------------------
 # Run:
 #   python -m streamlit run dashboard_streamlit_app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true
 
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.3.0"
 
 import os
 import json
@@ -116,11 +116,17 @@ def load_global_importance(path: Optional[str]) -> Optional[pd.DataFrame]:
         return out.sort_values("importance", ascending=False)
     return None
 
+@st.cache_data(show_spinner=False)
+def load_interpretability_summary(path: Optional[str]) -> dict:
+    if path and os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
 def get_expected_input_columns(model) -> Optional[List[str]]:
     try:
         m = model
         if isinstance(m, SkPipeline):
-            # ColumnTransformer inside Pipeline?
             for _, step in m.steps:
                 if isinstance(step, SkColumnTransformer) and hasattr(step, "feature_names_in_"):
                     return list(step.feature_names_in_)
@@ -128,6 +134,59 @@ def get_expected_input_columns(model) -> Optional[List[str]]:
             return list(m.feature_names_in_)
     except Exception:
         pass
+    return None
+
+def compute_local_shap(estimator, X_background: pd.DataFrame, x_row: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, List[str], np.ndarray]:
+    """
+    Calcule des contributions locales robustes (SHAP) :
+    - Ne garde que les colonnes numériques
+    - Cast en float64
+    - Aligne les colonnes entre background et l'observation
+    Retourne: (shap_values, base_values, columns, input_row_values)
+    """
+    import shap
+    # colonnes numériques communes
+    num_cols_bg = [c for c in X_background.columns if pd.api.types.is_numeric_dtype(X_background[c])]
+    num_cols_x  = [c for c in x_row.columns if pd.api.types.is_numeric_dtype(x_row[c])]
+    num_cols = [c for c in num_cols_bg if c in num_cols_x]
+    if not num_cols:
+        raise ValueError("Aucune colonne numérique commune pour SHAP.")
+    bg = X_background[num_cols].astype("float64")
+    xr = x_row[num_cols].astype("float64")
+    if len(bg) > 200:
+        bg = bg.sample(200, random_state=42)
+
+    def f(Xdf):
+        if not isinstance(Xdf, pd.DataFrame):
+            Xdf = pd.DataFrame(Xdf, columns=list(bg.columns))
+        # Ré-injecter dans l'ordre attendu par le modèle si besoin
+        try:
+            return estimator.predict_proba(Xdf)[:, 1]
+        except Exception:
+            # si le modèle attend plus de colonnes, on tente un alignement large mais ça échouera proprement
+            return estimator.predict_proba(Xdf.reindex(columns=bg.columns, fill_value=0.0))[:, 1]
+
+    masker = shap.maskers.Independent(bg)
+    explainer = shap.Explainer(f, masker, feature_names=list(bg.columns))
+    ex = explainer(xr)
+    vals = np.array(ex.values).reshape(-1)
+    base = np.array(ex.base_values).reshape(-1)
+    return vals, base, list(bg.columns), xr.iloc[0].to_numpy()
+
+def get_quantile_series(feature: str, pool_df: pd.DataFrame, X: pd.DataFrame) -> Optional[pd.Series]:
+    if feature in pool_df.columns and pd.api.types.is_numeric_dtype(pool_df[feature]):
+        return pool_df[feature]
+    if feature in X.columns and pd.api.types.is_numeric_dtype(X[feature]):
+        return X[feature]
+    return None
+
+def get_cohort_series(feature: str, cohort_df: pd.DataFrame, X: pd.DataFrame, ID_COL: Optional[str]) -> Optional[pd.Series]:
+    if feature in cohort_df.columns and pd.api.types.is_numeric_dtype(cohort_df[feature]):
+        return cohort_df[feature]
+    if ID_COL and ID_COL in cohort_df.columns and feature in X.columns:
+        idx = cohort_df[ID_COL].values
+        s = X.loc[X.index.intersection(idx), feature]
+        return s if pd.api.types.is_numeric_dtype(s) else None
     return None
 
 def prob_to_band(p: float, low=0.05, high=0.15) -> Tuple[str, str]:
@@ -164,92 +223,27 @@ def cost_curve(y_true: np.ndarray, p: np.ndarray, cost_fp: float, cost_fn: float
     best = df.iloc[best_pos].to_dict()
     return df, best
 
-# ---------- Local interpretability ----------
-def _is_all_numeric(df: pd.DataFrame) -> bool:
+# API helpers
+def api_health(base_url: str) -> tuple[bool, str]:
     try:
-        return all(pd.api.types.is_numeric_dtype(t) for _, t in df.dtypes.items())
-    except Exception:
-        return False
-
-def compute_local_shap_or_delta(estimator, background: pd.DataFrame, x_row: pd.DataFrame,
-                                max_features: int = 50) -> Tuple[pd.DataFrame, str]:
-    """
-    Tente SHAP (agnostique) ; si ça échoue, fallback 'delta-contributions':
-    on remplace chaque feature par une valeur de référence (médiane ou modalité majoritaire),
-    on recalcule la proba, et la 'contribution' = base_proba - proba_ref.
-    Retourne (df_contrib, method_label)
-    """
-    # 1) Tentative SHAP
-    try:
-        import shap
-        # Eviter l'erreur 'isfinite' -> si non numérique, on bascule direct en delta
-        if _is_all_numeric(background) and _is_all_numeric(x_row):
-            bg = background.copy()
-            if len(bg) > 200:
-                bg = bg.sample(200, random_state=42)
-            def f(Xdf):
-                if not isinstance(Xdf, pd.DataFrame):
-                    Xdf = pd.DataFrame(Xdf, columns=list(bg.columns))
-                return estimator.predict_proba(Xdf)[:, 1]
-            masker = shap.maskers.Independent(bg)
-            explainer = shap.Explainer(f, masker, feature_names=list(bg.columns))
-            ex = explainer(x_row)
-            vals = np.array(ex.values).reshape(-1)
-            out = pd.DataFrame({
-                "feature": list(x_row.columns),
-                "value": x_row.iloc[0].values,
-                "contrib": vals,
-                "abs_val": np.abs(vals),
-            }).sort_values("abs_val", ascending=False)
-            return out.head(max_features), "SHAP"
-        # sinon -> delta
-    except Exception:
-        pass
-
-    # 2) Fallback delta-contributions (robuste à tout)
-    try:
-        # Base proba
-        base_p = float(estimator.predict_proba(x_row)[0, 1])
-
-        # Valeurs de référence: médiane pour numériques, modalité la plus fréquente pour catégorielles
-        ref_vals: Dict[str, Any] = {}
-        for c in x_row.columns:
-            col_pop = background[c] if c in background.columns else None
-            if col_pop is not None and pd.api.types.is_numeric_dtype(col_pop):
-                ref_vals[c] = float(np.nanmedian(col_pop.values)) if not col_pop.dropna().empty else 0.0
-            else:
-                # Catégorie: prendre la modalité la plus fréquente (si dispo), sinon valeur actuelle
-                if col_pop is not None and not col_pop.dropna().empty:
-                    mode = pd.Series(col_pop.dropna().astype(str)).mode()
-                    ref_vals[c] = mode.iloc[0] if len(mode) else x_row.iloc[0][c]
-                else:
-                    ref_vals[c] = x_row.iloc[0][c]
-
-        rows = []
-        # On ne prend pas 200 features : limite à max_features (en suivant global importance si dispo ailleurs)
-        for c in list(x_row.columns)[:max_features]:
-            x_tmp = x_row.copy()
-            x_tmp.iloc[0, x_tmp.columns.get_loc(c)] = ref_vals[c]
-            try:
-                p_ref = float(estimator.predict_proba(x_tmp)[0, 1])
-                contrib = base_p - p_ref  # >0 => la valeur actuelle ↑ risque
-                rows.append({
-                    "feature": c,
-                    "value": x_row.iloc[0][c],
-                    "contrib": contrib,
-                    "abs_val": abs(contrib),
-                })
-            except Exception:
-                # ignorer si le modèle n'accepte pas la perturbation (rare)
-                continue
-
-        df = pd.DataFrame(rows).sort_values("abs_val", ascending=False)
-        return df, "DELTA"
+        r = requests.get(base_url.rstrip("/") + "/health", timeout=4)
+        if r.status_code == 200:
+            return True, "ok"
+        return False, f"HTTP {r.status_code}"
     except Exception as e:
-        # Dernier filet
-        return pd.DataFrame(columns=["feature", "value", "contrib", "abs_val"]), "NONE"
+        return False, str(e)
 
-# ---- PDF builders ----
+def api_predict(base_url: str, payload: dict) -> dict:
+    r = requests.post(base_url.rstrip("/") + "/predict", json=payload, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+def api_metrics(base_url: str, payload: dict) -> dict:
+    r = requests.post(base_url.rstrip("/") + "/metrics", json=payload, timeout=60)
+    r.raise_for_status()
+    return r.json()
+
+# ---- PDF builder ----
 def build_client_report_pdf(
     client_id: str,
     model_name: str,
@@ -303,9 +297,9 @@ def build_client_report_pdf(
     story.append(Paragraph("Contributions locales (top 10)", styles["H2"]))
     if shap_vals is not None and not shap_vals.empty:
         dfc = shap_vals.sort_values("abs_val", ascending=False).head(10).copy()
-        dfc["effet"] = dfc["contrib"].apply(lambda v: "↑ risque" if v > 0 else ("↓ risque" if v < 0 else "neutre"))
+        dfc["effet"] = dfc["shap_value"].apply(lambda v: "↑ risque" if v > 0 else ("↓ risque" if v < 0 else "neutre"))
         data = [["Variable", "Valeur", "Contribution", "Effet"]] + \
-               [[str(r["feature"]), str(r["value"]), f'{r["contrib"]:+.4f}', r["effet"]] for _, r in dfc.iterrows()]
+               [[str(r["feature"]), str(r["value"]), f'{r["shap_value"]:+.4f}', r["effet"]] for _, r in dfc.iterrows()]
         t2 = Table(data, hAlign="LEFT", colWidths=[7*cm, 3.5*cm, 3.5*cm, 2*cm])
     elif global_imp_df is not None and not global_imp_df.empty:
         dfc = global_imp_df.head(10)
@@ -325,7 +319,10 @@ def build_client_report_pdf(
     story.append(Spacer(1, 8))
 
     story.append(Paragraph("Variables clés", styles["H2"]))
-    keys = list(X.columns)[:20]
+    if global_imp_df is not None and not global_imp_df.empty:
+        keys = [f for f in global_imp_df["feature"].tolist() if f in X.columns][:20]
+    else:
+        keys = list(X.columns)[:20]
     kv = [["Variable", "Valeur"]]
     row = x_row.iloc[0] if not x_row.empty else pd.Series(dtype=object)
     for f in keys:
@@ -347,6 +344,134 @@ def build_client_report_pdf(
     buf.close()
     return pdf_bytes
 
+# ---- Suggestions "nouveau client" ----
+def suggest_actions(
+    shap_df: Optional[pd.DataFrame],
+    new_x: pd.DataFrame,
+    X: pd.DataFrame,
+    pool_df: pd.DataFrame,
+    top_n:int = 5,
+    global_imp_df: Optional[pd.DataFrame] = None,
+) -> tuple[list[dict], list[dict]]:
+    """
+    Retourne (axes_amelioration, points_forts).
+    """
+    def _quantiles_for(f: str):
+        s = None
+        if f in pool_df.columns and pd.api.types.is_numeric_dtype(pool_df[f]):
+            s = pool_df[f]
+        elif f in X.columns and pd.api.types.is_numeric_dtype(X[f]):
+            s = X[f]
+        if s is None or s.dropna().empty:
+            return None
+        q = s.quantile([0.1, 0.5, 0.9])
+        return {"p10": float(q.loc[0.1]), "p50": float(q.loc[0.5]), "p90": float(q.loc[0.9])}
+
+    RULES = {
+        "CREDIT_GOODS_RATIO": "Un ratio crédit/biens plus faible (apport initial plus élevé) réduit le risque.",
+        "ANNUITY_INCOME_RATIO": "Réduire la mensualité par rapport au revenu (renégocier durée/montant) améliore la solvabilité.",
+        "CREDIT_INCOME_RATIO": "Un endettement plus faible (crédit/revenu) est attendu chez les bons dossiers.",
+        "PAYMENT_RATE": "Un taux de mensualité plus faible par rapport au crédit peut alléger la pression budgétaire.",
+        "EXT_SOURCE_1": "Scores externes non actionnables directement ; maintenir un historique de paiement sain.",
+        "EXT_SOURCE_2": "Renforcer l’historique de paiement (zéro retard) améliore ce signal externe.",
+        "EXT_SOURCE_3": "Même idée : régularité des paiements, pas d’incidents, soldes à temps.",
+        "DAYS_EMPLOYED": "Une ancienneté plus élevée stabilise le profil (éviter les ruptures d’emploi si possible).",
+        "EMPLOY_TO_AGE_RATIO": "Un ratio emploi/âge plus élevé reflète une carrière plus stable.",
+    }
+
+    def _mk_note(feat:str, val:Any, shap_pos:bool, q:Optional[dict]):
+        base = RULES.get(str(feat))
+        if base:
+            return base
+        if q is None:
+            return "Contribution estimée vs profil moyen."
+        try:
+            v = float(val)
+        except Exception:
+            v = None
+        if v is None:
+            return "Contribution liée à la modalité observée."
+        if shap_pos:
+            if v >= q["p50"]:
+                return f"Valeur au-dessus de la médiane ({q['p50']:.2f}). Se rapprocher de la médiane peut réduire le risque."
+            else:
+                return f"Valeur en-dessous de la médiane ({q['p50']:.2f}). Se rapprocher de la médiane peut réduire le risque."
+        else:
+            pos_txt = "au-dessus" if v >= q["p50"] else "en-dessous"
+            return f"Point fort : valeur {pos_txt} de la médiane ({q['p50']:.2f})."
+
+    # Cas 1: SHAP dispo
+    if shap_df is not None and not shap_df.empty and not new_x.empty:
+        tmp = shap_df.copy().sort_values("abs_val", ascending=False)
+        pos = tmp[tmp["shap_value"] > 0].head(top_n)
+        neg = tmp[tmp["shap_value"] < 0].head(top_n)
+        axes, strong = [], []
+        row = new_x.iloc[0]
+        for _, r in pos.iterrows():
+            f = str(r["feature"]); v = row[f] if f in row.index else np.nan; q = _quantiles_for(f)
+            axes.append({"feature": f, "value": v, "note": _mk_note(f, v, True,  q)})
+        for _, r in neg.iterrows():
+            f = str(r["feature"]); v = row[f] if f in row.index else np.nan; q = _quantiles_for(f)
+            strong.append({"feature": f, "value": v, "note": _mk_note(f, v, False, q)})
+        return axes, strong
+
+    # Cas 2: fallback importance globale
+    axes, strong = [], []
+    if global_imp_df is None or global_imp_df.empty or new_x.empty:
+        return axes, strong
+
+    row = new_x.iloc[0]
+    HIGH_IS_RISK = {"CREDIT_GOODS_RATIO", "ANNUITY_INCOME_RATIO", "CREDIT_INCOME_RATIO",
+                    "AMT_REQ_CREDIT_BUREAU_DAY","AMT_REQ_CREDIT_BUREAU_WEEK","AMT_REQ_CREDIT_BUREAU_MON",
+                    "AMT_REQ_CREDIT_BUREAU_QRT","AMT_REQ_CREDIT_BUREAU_YEAR","EXT_SOURCES_NA","DOC_COUNT"}
+    LOW_IS_RISK  = {"EXT_SOURCES_MEAN","EXT_SOURCE_1","EXT_SOURCE_2","EXT_SOURCE_3","EMPLOY_TO_AGE_RATIO","PAYMENT_RATE"}
+
+    cand = [f for f in global_imp_df["feature"].tolist() if (f in X.columns or f in pool_df.columns)]
+    cand = cand[: max(top_n*3, 15)]
+
+    scored = []
+    for f in cand:
+        q = _quantiles_for(f)
+        if q is None:
+            continue
+        v = row[f] if f in row.index else np.nan
+        try:
+            v_float = float(v)
+        except Exception:
+            continue
+        spread = max(q["p90"] - q["p10"], 1e-9)
+        deviation = abs(v_float - q["p50"]) / spread
+        if f in HIGH_IS_RISK:
+            shap_pos_guess = (v_float > q["p50"])
+        elif f in LOW_IS_RISK:
+            shap_pos_guess = (v_float < q["p50"])
+        else:
+            shap_pos_guess = (v_float > q["p90"] or v_float < q["p10"])
+        scored.append((f, v, q, deviation, shap_pos_guess))
+
+    scored.sort(key=lambda t: t[3], reverse=True)
+
+    for f, v, q, _, shap_pos_guess in scored[:top_n]:
+        if shap_pos_guess:
+            axes.append({"feature": f, "value": v, "note": _mk_note(f, v, True,  q)})
+        else:
+            strong.append({"feature": f, "value": v, "note": _mk_note(f, v, False, q)})
+
+    if not axes:
+        forced = []
+        for f, v, q, _, _ in scored:
+            if (f in HIGH_IS_RISK and float(v) >= q["p50"]) or (f in LOW_IS_RISK and float(v) <= q["p50"]):
+                forced.append({"feature": f, "value": v, "note": _mk_note(f, v, True, q)})
+                if len(forced) >= min(3, top_n):
+                    break
+        if not forced:
+            for f, v, q, _, _ in scored[:min(3, top_n)]:
+                forced.append({"feature": f, "value": v, "note": _mk_note(f, v, True, q)})
+        axes = forced
+
+    return axes, strong
+
+
 def build_new_client_report_pdf(
     proba: Optional[float],
     threshold: float,
@@ -358,10 +483,9 @@ def build_new_client_report_pdf(
     global_imp_df: Optional[pd.DataFrame],
     shap_df: Optional[pd.DataFrame],
 ) -> bytes:
-    """PDF dédié 'Nouveau client' + axes d’amélioration & points forts."""
+    """PDF dédié 'Nouveau client' + message de remerciement + axes d'amélioration."""
     if not REPORTLAB_AVAILABLE:
         return b""
-
     buf = BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=1.5*cm, rightMargin=1.5*cm, topMargin=1.2*cm, bottomMargin=1.2*cm)
     styles = getSampleStyleSheet()
@@ -374,6 +498,12 @@ def build_new_client_report_pdf(
     story.append(Paragraph("Prêt à dépenser — Résultats (Nouveau client)", styles["TitleBig"]))
     story.append(Paragraph(f"Date: {now} • App: {APP_VERSION}", styles["Small"]))
     story.append(Spacer(1, 8))
+
+    story.append(Paragraph(
+        "Merci pour votre confiance. Voici vos résultats actuels et, en cas de refus, des axes d’amélioration possibles.",
+        styles["Small"]
+    ))
+    story.append(Spacer(1, 6))
 
     story.append(Paragraph("Score & décision", styles["H2"]))
     if proba is not None:
@@ -396,13 +526,52 @@ def build_new_client_report_pdf(
     story.append(t)
     story.append(Spacer(1, 8))
 
-    # Axes/Points forts via shap_df (qui peut venir du fallback delta)
+    axes, strong = suggest_actions(shap_df, new_x, X, pool_df, top_n=5, global_imp_df=global_imp_df)
+    story.append(Paragraph("Axes d’amélioration (si décision = Refus)", styles["H2"]))
+    if axes:
+        data = [["Variable", "Valeur", "Recommandation"]]
+        for a in axes:
+            data.append([str(a["feature"]), "" if pd.isna(a["value"]) else str(a["value"]), a["note"]])
+        t2 = Table(data, hAlign="LEFT", colWidths=[5.5*cm, 3.0*cm, 5.5*cm])
+    else:
+        t2 = Table([["Information", "Détail"], ["Recommandations", "Aucune recommandation spécifique (explicabilité locale indisponible)."]],
+                   hAlign="LEFT", colWidths=[7*cm, 7*cm])
+    t2.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
+        ("BOX", (0,0), (-1,-1), 0.25, colors.black),
+        ("INNERGRID", (0,0), (-1,-1), 0.25, colors.grey),
+        ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
+        ("FONTSIZE", (0,0), (-1,-1), 9),
+    ]))
+    story.append(t2)
+    story.append(Spacer(1, 8))
+
+    story.append(Paragraph("Points forts du dossier", styles["H2"]))
+    if strong:
+        data = [["Variable", "Valeur", "Commentaire"]]
+        for s in strong:
+            data.append([str(s["feature"]), "" if pd.isna(s["value"]) else str(s["value"]), s["note"]])
+        t3 = Table(data, hAlign="LEFT", colWidths=[5.5*cm, 3.0*cm, 5.5*cm])
+    else:
+        t3 = Table([["Information", "Détail"], ["Points forts", "Non disponibles (explicabilité locale indisponible)."]],
+                   hAlign="LEFT", colWidths=[7*cm, 7*cm])
+    t3.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
+        ("BOX", (0,0), (-1,-1), 0.25, colors.black),
+        ("INNERGRID", (0,0), (-1,-1), 0.25, colors.grey),
+        ("ALIGN", (2,1), (2,-1), "RIGHT"),
+        ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
+        ("FONTSIZE", (0,0), (-1,-1), 9),
+    ]))
+    story.append(t3)
+
+    story.append(Spacer(1, 8))
     story.append(Paragraph("Contributions locales (top 10)", styles["H2"]))
     if shap_df is not None and not shap_df.empty:
         dfc = shap_df.sort_values("abs_val", ascending=False).head(10).copy()
-        dfc["effet"] = dfc["contrib"].apply(lambda v: "↑ risque" if v > 0 else ("↓ risque" if v < 0 else "neutre"))
+        dfc["effet"] = dfc["shap_value"].apply(lambda v: "↑ risque" if v > 0 else ("↓ risque" if v < 0 else "neutre"))
         data = [["Variable", "Valeur", "Contribution", "Effet"]] + \
-               [[str(r["feature"]), str(r["value"]), f'{r["contrib"]:+.4f}', r["effet"]] for _, r in dfc.iterrows()]
+               [[str(r["feature"]), str(r["value"]), f'{r["shap_value"]:+.4f}', r["effet"]] for _, r in dfc.iterrows()]
         t4 = Table(data, hAlign="LEFT", colWidths=[6.0*cm, 3.5*cm, 3.0*cm, 2.0*cm])
     else:
         t4 = Table([["Information", "Détail"], ["Explicabilité", "Indisponible"]], hAlign="LEFT", colWidths=[10*cm, 4*cm])
@@ -435,6 +604,7 @@ MODEL_SIG  = _pick_first_existing(["model_calibrated_sigmoid.joblib"])
 MODEL_BASE = _pick_first_existing(["model_baseline_logreg.joblib"])
 FEATS_PATH = _pick_first_existing(["feature_names.npy"])
 GLOBIMP    = _pick_first_existing(["global_importance.csv"])
+INTERP_SUM = _pick_first_existing(["interpretability_summary.json"])
 
 with st.sidebar:
     # Diagnostics
@@ -455,26 +625,13 @@ with st.sidebar:
     api_ok = False
     if mode == "API FastAPI":
         api_base = st.text_input("API base URL", value="http://localhost:8000")
-        def api_health(base_url: str) -> tuple[bool, str]:
-            try:
-                r = requests.get(base_url.rstrip("/") + "/health", timeout=4)
-                if r.status_code == 200:
-                    return True, "ok"
-                return False, f"HTTP {r.status_code}"
-            except Exception as e:
-                return False, str(e)
         if api_base:
             ok, msg = api_health(api_base)
             api_ok = ok
             st.caption(f"Statut API: {'✅ OK' if ok else '❌ KO'} — {msg}")
 
-    # Paramètres
-    st.subheader("Paramètres du modèle / seuil")
-    default_thresh = float(np.clip(st.session_state.get("threshold", 0.67), 0.0, 1.0))
-    threshold = st.slider(
-        "Seuil d'acceptation (proba défaut)",
-        0.0, 1.0, float(default_thresh), 0.001, key="threshold",
-        help="Au-delà du seuil = risque élevé ⇒ refus")
+    if not DATA_TRAIN:
+        st.error("⚠️ Données non trouvées (placez `clients_demo.csv` ou `clients_demo.parquet` à la racine)")
 
 # Load datasets
 train_df = load_table(DATA_TRAIN) if DATA_TRAIN else pd.DataFrame()
@@ -482,18 +639,25 @@ holdout_df = load_table(DATA_TEST) if DATA_TEST else pd.DataFrame()
 pool_df = train_df if not train_df.empty else holdout_df
 feature_names = load_feature_names(FEATS_PATH, list(pool_df.columns)) if not pool_df.empty else []
 global_imp_df = load_global_importance(GLOBIMP)
+interp_summary = load_interpretability_summary(INTERP_SUM)
 
-# Identify ID/TARGET
 ID_COL = "SK_ID_CURR" if (not pool_df.empty and "SK_ID_CURR" in pool_df.columns) else (pool_df.columns[0] if not pool_df.empty else None)
 TARGET_COL = "TARGET" if (not pool_df.empty and "TARGET" in pool_df.columns) else None
 
-# Sidebar client picker (after data known)
+# Sidebar: paramètres + client
 with st.sidebar:
+    st.subheader("Paramètres du modèle / seuil")
+    default_thresh = float(np.clip(st.session_state.get("threshold", 0.67), 0.0, 1.0))
+    threshold = st.slider(
+        "Seuil d'acceptation (proba défaut)",
+        0.0, 1.0, float(default_thresh), 0.001, key="threshold",
+        help="Au-delà du seuil = risque élevé ⇒ refus")
+
     st.subheader("Sélection du client")
     id_options = pool_df[ID_COL].tolist() if (ID_COL and not pool_df.empty) else []
     selected_id = st.selectbox("SK_ID_CURR", id_options, index=0 if id_options else None)
 
-# Load local model if needed
+# Charger modèle local si nécessaire
 model_paths = {}
 if MODEL_ISO: model_paths["Calibré (Isotonic)"] = MODEL_ISO
 if MODEL_SIG: model_paths["Calibré (Sigmoid)"]  = MODEL_SIG
@@ -508,18 +672,16 @@ if mode == "Local (modèle embarqué)":
         except Exception:
             model_local = None
 
-# Align X
+# Préparer X aligné pour affichages
 if not pool_df.empty and selected_id is not None:
     df_idx = pool_df.set_index(ID_COL)
     expected_cols_local = get_expected_input_columns(model_local) if model_local is not None else (feature_names or list(df_idx.columns))
-    # Ensure all expected cols exist
     for c in expected_cols_local:
         if c not in df_idx.columns:
             df_idx[c] = np.nan
-    X = df_idx[expected_cols_local].copy()
+    X = df_idx[expected_cols_local]
     x_row = X.loc[[selected_id]]
-    # petit background pour local explications
-    background = X.sample(min(300, len(X)), random_state=42).copy()
+    background = X.sample(min(200, len(X)), random_state=42)
 else:
     X = pd.DataFrame(columns=feature_names)
     x_row = X.head(0)
@@ -535,8 +697,6 @@ TABS = [
     "🧪 Qualité des données",
     "🆕 Nouveau client",
     "💰 Seuil & coût métier",
-    "📚 Dictionnaire des variables",
-    "🧮 Ratios (feature engineering)",
 ]
 main_tabs = st.tabs(TABS)
 
@@ -546,26 +706,29 @@ main_tabs = st.tabs(TABS)
 with main_tabs[0]:
     st.subheader("Score individuel & interprétation")
     proba = None
-    contrib_df = None
-    method = "—"
+    shap_df = None
     source_label = "Local"
 
-    # API helpers (inline to avoid clutter)
-    def api_predict(base_url: str, payload: dict) -> dict:
-        r = requests.post(base_url.rstrip("/") + "/predict", json=payload, timeout=20)
-        r.raise_for_status()
-        return r.json()
-
-    # Predict
+    # PREDICT
     if mode == "API FastAPI":
         if not api_base or not api_ok:
             st.error("API indisponible.")
         else:
             try:
-                payload = {"client_id": selected_id, "threshold": float(threshold), "shap": False}
+                payload = {"client_id": selected_id, "threshold": float(threshold), "shap": True, "topk": 10}
                 resp = api_predict(api_base, payload)
                 proba = float(resp["proba_default"])
                 source_label = "API"
+                if resp.get("top_contrib"):
+                    rows = []
+                    for r in resp["top_contrib"]:
+                        rows.append({
+                            "feature": r["feature"],
+                            "shap_value": float(r["shap_value"]),
+                            "abs_val": abs(float(r["shap_value"])),
+                            "value": r["value"],
+                        })
+                    shap_df = pd.DataFrame(rows)
             except Exception as e:
                 st.warning(f"API KO ({e}). Bascule en Local si possible.")
                 if model_local is None:
@@ -603,38 +766,43 @@ with main_tabs[0]:
     with col2:
         st.markdown("**Contributions locales (Top 10)**")
 
-        use_local_exp = st.toggle("Activer contributions locales (SHAP si possible, sinon delta)", value=True)
-
         def _bar_from_df(df: pd.DataFrame, title: str) -> go.Figure:
-            tmp = df.copy().sort_values("abs_val").tail(10)
-            x_vals = np.asarray(tmp["contrib"].values, dtype=float)
+            tmp = df.copy()
+            tmp = tmp.sort_values("abs_val").tail(10)
+            x_vals = np.asarray(tmp["shap_value"].values, dtype=float)
             y_vals = tmp["feature"].astype(str).tolist()
-            hvr = [f"valeur: {v}" for v in tmp["value"]]
-            figb = go.Figure(go.Bar(x=x_vals, y=y_vals, orientation="h", hovertext=hvr, hoverinfo="text+x+y"))
-            figb.update_layout(title=title, xaxis_title="Contribution ( + = ↑ risque )")
-            # ligne verticale à 0
-            figb.add_vline(x=0, line_dash="dot", line_width=1)
+            hover = [f"valeur: {v}" for v in tmp["value"]]
+            figb = go.Figure(go.Bar(x=x_vals, y=y_vals, orientation="h", hovertext=hover, hoverinfo="text+x+y"))
+            figb.update_layout(title=title)
             return figb
 
-        if use_local_exp and model_local is not None and not x_row.empty and not background.empty:
-            contrib_df, method = compute_local_shap_or_delta(model_local, background, x_row, max_features=50)
-            if contrib_df is not None and not contrib_df.empty:
-                st.plotly_chart(_bar_from_df(contrib_df, f"Impact sur le score (positif = ↑ risque) — {method}"), use_container_width=True)
-            else:
-                st.info("Explicabilité locale indisponible ; affichage de l’importance globale.")
+        if mode == "API FastAPI" and shap_df is not None and not shap_df.empty:
+            st.plotly_chart(_bar_from_df(shap_df, "Impact sur le score (positif = ↑ risque)"), use_container_width=True)
         else:
-            st.info("Explicabilité locale désactivée ; affichage de l’importance globale.")
-
-        if (not use_local_exp) or (contrib_df is None or contrib_df.empty):
-            if global_imp_df is not None and not global_imp_df.empty:
-                tmp = global_imp_df.head(10).copy()
-                x_vals = np.asarray(tmp["importance"].values, dtype=float)
-                y_vals = tmp["feature"].astype(str).tolist()
-                figb = go.Figure(go.Bar(x=x_vals, y=y_vals, orientation="h"))
-                figb.update_layout(title="Top 10 — Importance globale")
-                st.plotly_chart(figb, use_container_width=True)
+            shap_enabled = st.toggle("Activer SHAP local (expérimental)", value=False)
+            if shap_enabled and not background.empty and model_local is not None:
+                try:
+                    vals, base_vals, cols_num, row_vals = compute_local_shap(model_local, background, x_row)
+                    shap_df_local = pd.DataFrame({
+                        "feature": cols_num,
+                        "shap_value": vals,
+                        "abs_val": np.abs(vals),
+                        "value": row_vals,
+                    }).sort_values("abs_val", ascending=False)
+                    st.plotly_chart(_bar_from_df(shap_df_local, "Impact sur le score (positif = ↑ risque)"),
+                                    use_container_width=True)
+                except Exception as e:
+                    st.warning(f"SHAP local indisponible: {e}")
             else:
-                st.info("Importance globale indisponible.")
+                if global_imp_df is not None and not global_imp_df.empty:
+                    tmp = global_imp_df.head(10).copy()
+                    x_vals = np.asarray(tmp["importance"].values, dtype=float)
+                    y_vals = tmp["feature"].astype(str).tolist()
+                    figb = go.Figure(go.Bar(x=x_vals, y=y_vals, orientation="h"))
+                    figb.update_layout(title="Top 10 — Importance globale")
+                    st.plotly_chart(figb, use_container_width=True)
+                else:
+                    st.info("Importance globale indisponible.")
 
     st.divider()
     st.subheader("📄 Export")
@@ -645,14 +813,14 @@ with main_tabs[0]:
             client_id_str = str(selected_id) if selected_id is not None else "NA"
             pdf_bytes = build_client_report_pdf(
                 client_id=client_id_str,
-                model_name=f"{source_label}/{method}",
+                model_name=f"{source_label}",
                 threshold=float(threshold),
                 proba=proba,
                 x_row=x_row,
                 X=X,
                 pool_df=pool_df,
                 global_imp_df=global_imp_df,
-                shap_vals=(contrib_df if contrib_df is not None and not contrib_df.empty else None),
+                shap_vals=(shap_df if shap_df is not None and not shap_df.empty else None),
             )
             filename = f"fiche_client_{client_id_str}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
             st.download_button("📄 Exporter la fiche client (PDF)", data=pdf_bytes, file_name=filename, mime="application/pdf",
@@ -668,7 +836,7 @@ with main_tabs[1]:
     if x_row.empty:
         st.info("Sélectionnez un client dans la barre latérale.")
     else:
-        if global_imp_df is not None and not global_imp_df.empty:
+        if global_imp_df is not None:
             key_feats = [f for f in global_imp_df.head(20)["feature"].tolist() if f in X.columns]
         else:
             key_feats = list(X.columns)[:20]
@@ -696,14 +864,14 @@ with main_tabs[2]:
             cohort_df = cohort_df[cohort_df[c] == pool_df.loc[pool_df[ID_COL] == selected_id, c].iloc[0]]
         st.caption(f"Taille de la cohorte similaire : **{len(cohort_df):,}**")
 
-        # features comparées: prendre jusqu'à 8 numériques parmi les plus importantes
         if global_imp_df is not None and not global_imp_df.empty:
-            cand = [f for f in global_imp_df["feature"].tolist() if f in pool_df.columns]
+            cand = [f for f in global_imp_df["feature"].tolist() if (f in X.columns or f in pool_df.columns)]
         else:
-            cand = [f for f in list(pool_df.columns)]
+            cand = [f for f in list(X.columns) if (f in X.columns or f in pool_df.columns)]
+
         comp_feats = []
         for f in cand:
-            if pd.api.types.is_numeric_dtype(pool_df[f]) and pool_df[f].dropna().size > 0:
+            if get_quantile_series(f, pool_df, X) is not None:
                 comp_feats.append(f)
             if len(comp_feats) >= 8:
                 break
@@ -713,14 +881,14 @@ with main_tabs[2]:
         else:
             long_rows = []
             for f in comp_feats:
-                s_pop = pool_df[f].dropna()
-                if s_pop.empty:
+                s_pop = get_quantile_series(f, pool_df, X)
+                if s_pop is None or s_pop.dropna().empty:
                     continue
-                s_coh = cohort_df[f].dropna() if f in cohort_df.columns else None
+                s_coh = get_cohort_series(f, cohort_df, X, ID_COL)
                 client_val = float(x_row[f].iloc[0]) if f in X.columns and pd.notnull(x_row[f].iloc[0]) else np.nan
 
                 pop_q = s_pop.quantile([0.1, 0.5, 0.9]).values
-                if s_coh is not None and not s_coh.empty:
+                if s_coh is not None and not s_coh.dropna().empty:
                     coh_q = s_coh.quantile([0.1, 0.5, 0.9]).values
                 else:
                     coh_q = [np.nan, np.nan, np.nan]
@@ -748,7 +916,7 @@ with main_tabs[2]:
                     figc.add_trace(go.Scatter(x=x_p90, y=y_feat, mode="markers", name="P90"))
                     figc.add_trace(go.Scatter(x=x_cli, y=y_feat, mode="markers", name="Client",
                                               marker=dict(symbol="diamond", size=12)))
-                    figc.update_layout(title=f"{grp} — Positionnement du client (P10/P50/P90)", height=420)
+                    figc.update_layout(title=f"{grp} — Positionnement du client (P10/P50/P90)", height=400)
                     st.plotly_chart(figc, use_container_width=True)
 
 # -------------------------------
@@ -756,33 +924,12 @@ with main_tabs[2]:
 # -------------------------------
 with main_tabs[3]:
     st.subheader("Qualité des données & valeurs manquantes")
-    # Image (si fournie)
     miss_fig = _pick_first_existing(["__results___5_1.png", "missing_train.png"])
     if miss_fig:
-        st.image(miss_fig, caption="Top taux de valeurs manquantes (train)", use_column_width=True)
+        # Pas de use_container_width ici (compat broader)
+        st.image(miss_fig, caption="Top taux de valeurs manquantes (train)")
     else:
         st.info("Figure de valeurs manquantes non trouvée.")
-
-    st.markdown("### Ratio : MISSING_COUNT_ROW")
-    if not pool_df.empty:
-        # On calcule sur les colonnes réellement présentes
-        cols_present = list(pool_df.columns)
-        # Ne pas inclure TARGET/ID
-        cols_present = [c for c in cols_present if c not in {ID_COL, TARGET_COL}]
-        s_missing = pool_df[cols_present].isna().sum(axis=1)
-        # valeur client
-        client_missing = int(s_missing.loc[pool_df[pool_df[ID_COL] == selected_id].index].iloc[0]) if selected_id is not None else None
-        figm = go.Figure()
-        hist = np.histogram(s_missing.values, bins=20)
-        figm.add_trace(go.Bar(x=hist[1][:-1], y=hist[0], name="Nb lignes"))
-        figm.update_layout(title="Distribution du nombre de valeurs manquantes par ligne",
-                           xaxis_title="Nombre de NA par ligne", yaxis_title="Effectif", height=350)
-        if client_missing is not None:
-            figm.add_vline(x=client_missing, line_width=2, line_dash="dash", line_color="red",
-                           annotation_text=f"Client: {client_missing} NA", annotation_position="top right")
-        st.plotly_chart(figm, use_container_width=True)
-    else:
-        st.info("Données indisponibles pour calculer MISSING_COUNT_ROW.")
 
 # -------------------------------
 # Tab 5 — Nouveau client
@@ -810,24 +957,23 @@ with main_tabs[4]:
             keys = [f for f in global_imp_df["feature"].tolist() if f in X.columns][:topk]
         else:
             keys = list(X.columns)[:topk]
-        num_cand = [f for f in keys if pd.api.types.is_numeric_dtype(X[f])]
+        num_cand = [f for f in keys if f in X.columns and pd.api.types.is_numeric_dtype(X[f])]
         cat_cand = [f for f in keys if f not in num_cand]
 
         st.markdown("**Saisie manuelle** — valeurs par défaut = médiane (num) / modalité la plus fréquente (cat)")
-        cols_in = st.columns(2)
+        cols = st.columns(2)
         inputs: Dict[str, Any] = {}
-        with cols_in[0]:
+        with cols[0]:
             for f in num_cand:
                 series = X[f]
                 default = float(np.nanmedian(series.values)) if np.isfinite(np.nanmedian(series.values)) else 0.0
                 inputs[f] = st.number_input(f, value=float(default))
-        with cols_in[1]:
+        with cols[1]:
             for f in cat_cand:
                 series = pd.Series(X[f].dropna().astype(str))
                 mode = series.mode().iloc[0] if not series.empty else "NA"
                 opts = sorted(series.unique().tolist()[:50]) or ["NA"]
-                idx = opts.index(mode) if mode in opts else 0
-                inputs[f] = st.selectbox(f, options=opts, index=idx)
+                inputs[f] = st.selectbox(f, options=opts, index=(opts.index(mode) if mode in opts else 0))
 
         if st.button("Simuler"):
             new_x = pd.DataFrame([inputs])
@@ -837,33 +983,52 @@ with main_tabs[4]:
         for c in exp_cols:
             if c not in new_x.columns:
                 new_x[c] = np.nan
-        new_x = new_x[exp_cols].copy()
-        st.session_state["last_new_x"] = new_x.copy()
+        new_x = new_x[exp_cols]
 
-        # Score local/API
-        new_p, contrib_df2, method2 = None, None, "—"
-        if mode == "API FastAPI" and api_ok:
-            try:
-                payload = {
-                    "features": {k: (None if pd.isna(v) else v) for k, v in new_x.iloc[0].to_dict().items()},
-                    "threshold": float(threshold), "shap": False
-                }
-                resp = requests.post(api_base.rstrip("/") + "/predict", json=payload, timeout=20)
-                resp.raise_for_status()
-                j = resp.json()
-                new_p = float(j["proba_default"])
-            except Exception as e:
-                st.error(f"API KO: {e}")
-                new_p = None
+        if mode == "API FastAPI":
+            if not api_base or not api_ok:
+                st.error("API indisponible pour scorer le nouveau client.")
+            else:
+                try:
+                    payload = {
+                        "features": {k: (None if pd.isna(v) else v) for k, v in new_x.iloc[0].to_dict().items()},
+                        "threshold": float(threshold), "shap": True, "topk": 10
+                    }
+                    resp = api_predict(api_base, payload)
+                    new_p = float(resp["proba_default"])
+                    shap_rows = resp.get("top_contrib") or []
+                    if shap_rows:
+                        shap_df2 = pd.DataFrame([{
+                            "feature": r["feature"],
+                            "shap_value": float(r["shap_value"]),
+                            "abs_val": abs(float(r["shap_value"])),
+                            "value": r["value"],
+                        } for r in shap_rows])
+                    else:
+                        shap_df2 = None
+                except Exception as e:
+                    st.error(f"API KO: {e}")
+                    new_p, shap_df2 = None, None
         else:
             if model_local is None:
                 st.error("Modèle local indisponible.")
+                new_p, shap_df2 = None, None
             else:
                 try:
                     new_p = float(model_local.predict_proba(new_x)[0, 1])
+                    try:
+                        vals, _, cols_num2, row_vals2 = compute_local_shap(model_local, background, new_x)
+                        shap_df2 = pd.DataFrame({
+                            "feature": cols_num2,
+                            "shap_value": vals,
+                            "abs_val": np.abs(vals),
+                            "value": row_vals2,
+                        }).sort_values("abs_val", ascending=False).head(10)
+                    except Exception:
+                        shap_df2 = None
                 except Exception as e:
                     st.error(f"Échec de la prédiction: {e}")
-                    new_p = None
+                    new_p, shap_df2 = None, None
 
         if new_p is not None:
             band2, color2 = prob_to_band(float(new_p), low=0.05, high=0.15)
@@ -884,28 +1049,33 @@ with main_tabs[4]:
                 title={"text": f"Probabilité de défaut (nouveau client) — {mode.split()[0]}"},
             ))
             st.plotly_chart(fign, use_container_width=True)
+
             st.markdown(f"**Décision (seuil {float(threshold):.3f})** : **{decision}**")
             st.markdown(f"Niveau de risque : **{band2}**")
 
-            # Contributions locales (SHAP si possible ; sinon delta)
-            if model_local is not None:
-                contrib_df2, method2 = compute_local_shap_or_delta(model_local, background, new_x, max_features=50)
+            used_fallback = (shap_df2 is None) or shap_df2.empty
+            axes, strong = suggest_actions(shap_df2, new_x, X, pool_df, top_n=5, global_imp_df=global_imp_df)
+
+            if used_fallback:
+                st.info("Explicabilité locale indisponible ; recommandations basées sur l’importance globale.")
 
             with st.expander("🛠️ Axes d’amélioration (si décision = Refus)"):
-                if contrib_df2 is not None and not contrib_df2.empty:
-                    df_axes = contrib_df2[contrib_df2["contrib"] > 0].copy().head(10)
-                    df_axes["Effet"] = "↑ risque"
-                    df_axes = df_axes.rename(columns={"feature": "Variable", "value": "Valeur", "contrib": "Contribution"})
-                    st.dataframe(df_axes[["Variable", "Valeur", "Contribution", "Effet"]], use_container_width=True)
+                if axes:
+                    st.dataframe(pd.DataFrame([{
+                        "Variable": a["feature"],
+                        "Valeur": ("" if pd.isna(a["value"]) else a["value"]),
+                        "Recommandation": a["note"],
+                    } for a in axes]), use_container_width=True)
                 else:
                     st.info("Aucune recommandation spécifique (explicabilité locale indisponible).")
 
             with st.expander("🌟 Points forts"):
-                if contrib_df2 is not None and not contrib_df2.empty:
-                    df_pf = contrib_df2[contrib_df2["contrib"] < 0].copy().head(10)
-                    df_pf["Effet"] = "↓ risque"
-                    df_pf = df_pf.rename(columns={"feature": "Variable", "value": "Valeur", "contrib": "Contribution"})
-                    st.dataframe(df_pf[["Variable", "Valeur", "Contribution", "Effet"]], use_container_width=True)
+                if strong:
+                    st.dataframe(pd.DataFrame([{
+                        "Variable": s["feature"],
+                        "Valeur": ("" if pd.isna(s["value"]) else s["value"]),
+                        "Commentaire": s["note"],
+                    } for s in strong]), use_container_width=True)
                 else:
                     st.info("Non disponible (explicabilité locale indisponible).")
 
@@ -924,7 +1094,7 @@ with main_tabs[4]:
                         X=X,
                         pool_df=pool_df,
                         global_imp_df=global_imp_df,
-                        shap_df=contrib_df2
+                        shap_df=shap_df2
                     )
                     fname = f"nouveau_client_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
                     st.download_button("📄 Télécharger le PDF (nouveau client)",
@@ -933,294 +1103,218 @@ with main_tabs[4]:
                 except Exception as e:
                     st.error(f"Échec génération PDF nouveau client : {e}")
 
+            if shap_df2 is not None and not shap_df2.empty:
+                tmp = shap_df2.copy().sort_values("abs_val").tail(10)
+                x_vals = np.asarray(tmp["shap_value"].values, dtype=float)
+                y_vals = tmp["feature"].astype(str).tolist()
+                figb2 = go.Figure(go.Bar(x=x_vals, y=y_vals, orientation="h"))
+                figb2.update_layout(title="Contributions locales (SHAP) — top 10")
+                st.plotly_chart(figb2, use_container_width=True)
+
 # -------------------------------
 # Tab 6 — Seuil & coût métier
 # -------------------------------
 with main_tabs[5]:
     st.subheader("Seuil & coût métier (optimisation)")
+
+    # Ligne des réglages
     cols_opt = st.columns(4)
     with cols_opt[0]:
         unit = st.selectbox("Unité monétaire", ["€", "CHF", "USD"], index=0)
+        st.caption("Étiquette affichée sur les graphiques et tableaux (n’influe pas les calculs).")
     with cols_opt[1]:
         cost_fp = st.number_input("Coût d'un FP (refus à tort)", min_value=0.0, value=100.0, step=10.0)
+        st.caption("➜ Plus vous montez ce coût, plus l’optimum va **remonter le seuil** (accepter davantage pour éviter de rater de bons clients).")
     with cols_opt[2]:
         cost_fn = st.number_input("Coût d'un FN (acceptation risquée)", min_value=0.0, value=1000.0, step=10.0)
+        st.caption("➜ Plus vous montez ce coût, plus l’optimum va **baisser le seuil** (être plus prudent pour éviter les défauts).")
     with cols_opt[3]:
         max_sample = st.number_input("Taille échantillon (max)", min_value=1000, value=20000, step=1000)
+        st.caption("**Grand** = résultat plus stable, un peu plus lent · **Petit** = plus rapide, mais l’optimum peut légèrement varier.")
 
-    if model_local is None or X.empty or TARGET_COL is None:
-        st.info("Pour optimiser le seuil en local, il faut : un **modèle local**, des **données** et la colonne **TARGET**.")
-    else:
-        labeled = pool_df.dropna(subset=[TARGET_COL]).copy()
-        if len(labeled) == 0:
-            st.warning("Aucune ligne labellisée trouvée (TARGET manquant).")
-        else:
-            df_lab = labeled.set_index(ID_COL)
-            expected = list(X.columns)
-            for c in expected:
-                if c not in df_lab.columns:
-                    df_lab[c] = np.nan
-            X_all = df_lab[expected]
-            y_all = df_lab[TARGET_COL].astype(int)
+    # Données + mode
+    if mode == "API FastAPI" and api_ok:
+        try:
+            payload = {"cost_fp": float(cost_fp), "cost_fn": float(cost_fn), "max_sample": int(max_sample), "step": 0.001}
+            m = api_metrics(api_base, payload)
+            auc = float(m.get("auc", float("nan")))
+            roc = m.get("roc", {})
+            pr  = m.get("pr", {})
+            cc  = m.get("cost_curve", {})
+            st.caption(f"Échantillon scoré côté API : **{m.get('n_scored', 0):,}** lignes")
 
-            if len(X_all) > max_sample:
-                X_all = X_all.sample(int(max_sample), random_state=42)
-                y_all = y_all.loc[X_all.index]
+            # ROC
+            if roc.get("fpr") and roc.get("tpr"):
+                fpr = np.asarray(roc["fpr"], dtype=float)
+                tpr = np.asarray(roc["tpr"], dtype=float)
+                fig_roc = go.Figure()
+                fig_roc.add_trace(go.Scatter(x=fpr, y=tpr, mode="lines", name=f"ROC (AUC={auc:.3f})"))
+                fig_roc.add_trace(go.Scatter(x=np.asarray([0,1], dtype=float), y=np.asarray([0,1], dtype=float),
+                                             mode="lines", name="Random", line=dict(dash="dash")))
+                fig_roc.update_layout(title="Courbe ROC", xaxis_title="FPR", yaxis_title="TPR", height=350)
+                st.plotly_chart(fig_roc, use_container_width=True)
+                st.markdown("> **ROC & AUC** — Mesure la capacité du modèle à **séparer les défaillants des bons payeurs**. "
+                            "Plus la courbe épouse le **coin en haut à gauche**, mieux c’est (AUC proche de 1).")
 
-            try:
-                p_all = model_local.predict_proba(X_all)[:, 1]
-            except Exception as e:
-                st.error(f"Impossible de scorer l'échantillon : {e}")
-                p_all = None
+            # PR
+            if pr.get("precision") and pr.get("recall"):
+                prec = np.asarray(pr["precision"], dtype=float)
+                rec  = np.asarray(pr["recall"], dtype=float)
+                fig_pr = go.Figure()
+                fig_pr.add_trace(go.Scatter(x=rec, y=prec, mode="lines", name="Precision-Recall"))
+                fig_pr.update_layout(title="Précision–Rappel", xaxis_title="Recall", yaxis_title="Precision", height=350)
+                st.plotly_chart(fig_pr, use_container_width=True)
+                st.markdown("> **Précision–Rappel** — Particulièrement utile quand la classe « défaut » est rare. "
+                            "Plus la courbe est **en haut à droite**, mieux c’est (forte précision ET rappel).")
 
-            if p_all is not None:
-                try:
-                    auc = roc_auc_score(y_all.values, p_all)
-                except Exception:
-                    auc = float("nan")
-
-                try:
-                    fpr, tpr, roc_th = roc_curve(y_all.values, p_all)
-                    fig_roc = go.Figure()
-                    fig_roc.add_trace(go.Scatter(x=np.asarray(fpr, dtype=float),
-                                                 y=np.asarray(tpr, dtype=float),
-                                                 mode="lines", name=f"ROC (AUC={auc:.3f})"))
-                    fig_roc.add_trace(go.Scatter(x=np.asarray([0,1], dtype=float),
-                                                 y=np.asarray([0,1], dtype=float),
-                                                 mode="lines", name="Random", line=dict(dash="dash")))
-                    fig_roc.update_layout(title="Courbe ROC", xaxis_title="FPR", yaxis_title="TPR", height=350)
-                    st.plotly_chart(fig_roc, use_container_width=True)
-                except Exception:
-                    pass
-
-                try:
-                    prec, rec, pr_th = precision_recall_curve(y_all.values, p_all)
-                    fig_pr = go.Figure()
-                    fig_pr.add_trace(go.Scatter(x=np.asarray(rec, dtype=float),
-                                                y=np.asarray(prec, dtype=float),
-                                                mode="lines", name="Precision-Recall"))
-                    fig_pr.update_layout(title="Précision–Rappel", xaxis_title="Recall", yaxis_title="Precision", height=350)
-                    st.plotly_chart(fig_pr, use_container_width=True)
-                except Exception:
-                    pass
-
-                df_cost, best = cost_curve(y_all.values, p_all, cost_fp, cost_fn, step=0.001)
+            # Cost curve
+            thr = np.asarray(cc.get("threshold", []), dtype=float)
+            cst = np.asarray(cc.get("cost", []), dtype=float)
+            best = cc.get("best", {})
+            if len(thr) and len(cst) and best:
                 fig_cost = go.Figure()
-                fig_cost.add_trace(go.Scatter(x=np.asarray(df_cost["threshold"].values, dtype=float),
-                                              y=np.asarray(df_cost["cost"].values, dtype=float),
-                                              mode="lines", name="Coût total"))
-                fig_cost.add_vline(x=float(best["threshold"]), line_width=2, line_dash="dash", line_color="green",
-                                   annotation_text=f"Seuil optimal = {best['threshold']:.3f}",
+                fig_cost.add_trace(go.Scatter(x=thr, y=cst, mode="lines", name="Coût total"))
+                fig_cost.add_vline(x=float(best.get("threshold", 0.0)), line_width=2, line_dash="dash", line_color="green",
+                                   annotation_text=f"Seuil optimal = {float(best.get('threshold', 0.0)):.3f}",
                                    annotation_position="top left")
                 fig_cost.add_vline(x=float(st.session_state["threshold"]), line_width=2, line_dash="dot", line_color="red",
                                    annotation_text=f"Seuil courant = {st.session_state['threshold']:.3f}",
                                    annotation_position="top right")
-                fig_cost.update_layout(title=f"Coût vs Seuil ({unit})", xaxis_title="Seuil", yaxis_title=f"Coût total ({unit})", height=350)
+                fig_cost.update_layout(title=f"Coût vs Seuil ({unit})", xaxis_title="Seuil",
+                                       yaxis_title=f"Coût total ({unit})", height=350)
                 st.plotly_chart(fig_cost, use_container_width=True)
 
-                cur = cost_at_threshold(y_all.values, p_all, float(st.session_state["threshold"]), cost_fp, cost_fn)
+                # Tableau synthèse
+                st.markdown("**Synthèse (API)**")
                 best_row = {
-                    "Seuil": f"{best['threshold']:.3f}",
-                    "Coût total": f"{best['cost']:.0f} {unit}",
-                    "TP": int(best["tp"]), "FP": int(best["fp"]), "FN": int(best["fn"]), "TN": int(best["tn"]),
-                    "Précision": f"{best['precision']:.3f}", "Rappel": f"{best['recall']:.3f}", "F1": f"{best['f1']:.3f}",
+                    "Seuil": f"{float(best.get('threshold', 0.0)):.3f}",
+                    "Coût total": f"{float(best.get('cost', 0.0)):.0f} {unit}",
+                    "TP": int(best.get("tp", 0)), "FP": int(best.get("fp", 0)),
+                    "FN": int(best.get("fn", 0)), "TN": int(best.get("tn", 0)),
+                    "Précision": f"{float(best.get('precision', 0.0)):.3f}",
+                    "Rappel": f"{float(best.get('recall', 0.0)):.3f}",
+                    "F1": f"{float(best.get('f1', 0.0)):.3f}",
                 }
                 cur_row = {
                     "Seuil": f"{st.session_state['threshold']:.3f}",
-                    "Coût total": f"{cur['cost']:.0f} {unit}",
-                    "TP": int(cur["tp"]), "FP": int(cur["fp"]), "FN": int(cur["fn"]), "TN": int(cur["tn"]),
-                    "Précision": f"{cur['precision']:.3f}", "Rappel": f"{cur['recall']:.3f}", "F1": f"{cur['f1']:.3f}",
+                    "Coût total": "—", "TP": "—", "FP": "—", "FN": "—", "TN": "—",
+                    "Précision": "—", "Rappel": "—", "F1": "—",
                 }
-                st.markdown("**Synthèse**")
-                st.dataframe(pd.DataFrame([best_row, cur_row], index=["Seuil optimal", "Seuil courant"]))
+                st.dataframe(pd.DataFrame([best_row, cur_row], index=["Seuil optimal (API)", "Seuil courant"]))
 
-                apply_cols = st.columns([1,2])
-                with apply_cols[0]:
-                    if st.button("✅ Appliquer le seuil optimal au dashboard"):
-                        st.session_state["threshold"] = float(best["threshold"])
-                        st.success(f"Seuil mis à jour à {best['threshold']:.3f}.")
-                        st.rerun()
-                with apply_cols[1]:
-                    st.caption("Le seuil optimal minimise le coût total attendu : `coût = FP × coût_FP + FN × coût_FN`.")
+                # Bouton grisé + explication
+                cols_btn = st.columns([1, 4])
+                with cols_btn[0]:
+                    st.button("✅ Appliquer le seuil optimal au dashboard", disabled=True)
+                with cols_btn[1]:
+                    st.caption("Cette fonctionnalité sert à **appliquer automatiquement** le seuil optimal calculé "
+                               "au **slider principal** du tableau de bord, pour **harmoniser la décision** en production. "
+                               "Elle sera disponible **après le RETEX dans 6 mois**.")
+            else:
+                st.info("Courbe de coût non disponible depuis l'API.")
+        except Exception as e:
+            st.error(f"Échec récupération métriques API : {e}")
 
-# -------------------------------
-# Tab 7 — Dictionnaire des variables
-# -------------------------------
-with main_tabs[6]:
-    st.subheader("Dictionnaire des variables (auto)")
-    if pool_df.empty:
-        st.info("Données indisponibles.")
     else:
-        def french_label(name: str) -> str:
-            # Traduction simple par règles (couvre tous les termes d'une manière lisible)
-            rep = (
-                ("AMT_", "Montant "),
-                ("AMT", "Montant "),
-                ("INCOME", "Revenu"),
-                ("ANNUITY", "Mensualité"),
-                ("GOODS", "Biens"),
-                ("CREDIT", "Crédit"),
-                ("DAYS", "Jours"),
-                ("YEARS", "Années"),
-                ("EXT_SOURCE", "Score externe"),
-                ("EXT SOURCES", "Scores externes"),
-                ("CNT", "Nombre"),
-                ("FAM", "Famille"),
-                ("REGION", "Région"),
-                ("NAME", "Nom"),
-                ("FLAG", "Drapeau"),
-                ("OWN", "Possession"),
-                ("REALTY", "Immobilier"),
-                ("CAR", "Voiture"),
-                ("EMPLOY", "Emploi"),
-                ("OCCUPATION", "Métier"),
-                ("ORGANIZATION", "Organisation"),
-                ("WEEKDAY", "JourSemaine"),
-                ("HOUR", "Heure"),
-                ("HOUSETYPE", "TypeHabitation"),
-                ("FONDKAPREMONT", "Fonds de réparation"),
-                ("WALLSMATERIAL", "Matériaux murs"),
-                ("EMERGENCYSTATE", "État d'urgence"),
-                ("RATIO", "Ratio"),
-                ("_MEAN", " (moyenne)"),
-                ("_SUM", " (somme)"),
-                ("_NA", " (nb NA)"),
-                ("_BIN", " (bin)"),
-            )
-            s = name.upper()
-            for a, b in rep:
-                s = s.replace(a, b.upper())
-            # espaces et casse douce
-            s = s.replace("_", " ").strip().title()
-            return s
+        # Mode Local
+        mdl_local = model_local
+        if mdl_local is None or X.empty or TARGET_COL is None:
+            st.info("Pour optimiser le seuil en local, il faut : un **modèle local**, des **données** et la colonne **TARGET**.")
+        else:
+            labeled = pool_df.dropna(subset=[TARGET_COL]).copy()
+            if len(labeled) == 0:
+                st.warning("Aucune ligne labellisée trouvée (TARGET manquant).")
+            else:
+                df_lab = labeled.set_index(ID_COL)
+                expected = list(X.columns)
+                for c in expected:
+                    if c not in df_lab.columns:
+                        df_lab[c] = np.nan
+                X_all = df_lab[expected]
+                y_all = df_lab[TARGET_COL].astype(int)
 
-        cols = [c for c in pool_df.columns if c not in {TARGET_COL}]
-        df_dict = pd.DataFrame({
-            "Variable": cols,
-            "Libellé (FR)": [french_label(c) for c in cols],
-        })
-        st.dataframe(df_dict, use_container_width=True)
+                if len(X_all) > max_sample:
+                    X_all = X_all.sample(int(max_sample), random_state=42)
+                    y_all = y_all.loc[X_all.index]
 
-# -------------------------------
-# Tab 8 — Ratios (feature engineering)
-# -------------------------------
-with main_tabs[7]:
-    st.subheader("Ratios (calculs & interprétation)")
-    if pool_df.empty:
-        st.info("Données indisponibles.")
-    else:
-        # calculs pour le client sélectionné
-        def compute_ratios(df_row: pd.Series) -> Dict[str, Any]:
-            r: Dict[str, Any] = {}
-            g = df_row.get
-
-            # Âge
-            if pd.notnull(g("AGE_YEARS")):
-                r["AGE_YEARS"] = g("AGE_YEARS")
-            elif pd.notnull(g("DAYS_BIRTH")):
-                r["AGE_YEARS"] = round(abs(float(g("DAYS_BIRTH"))) / 365.25, 2)
-
-            # Ancienneté emploi
-            if pd.notnull(g("EMPLOY_YEARS")):
-                r["EMPLOY_YEARS"] = g("EMPLOY_YEARS")
-            elif pd.notnull(g("DAYS_EMPLOYED")):
-                r["EMPLOY_YEARS"] = round(abs(float(g("DAYS_EMPLOYED"))) / 365.25, 2)
-
-            # Ancienneté enregistrement
-            if pd.notnull(g("REG_YEARS")):
-                r["REG_YEARS"] = g("REG_YEARS")
-            elif pd.notnull(g("DAYS_REGISTRATION")):
-                r["REG_YEARS"] = round(abs(float(g("DAYS_REGISTRATION"))) / 365.25, 2)
-
-            # Ratios financiers
-            try:
-                r["CREDIT_INCOME_RATIO"] = float(g("AMT_CREDIT")) / float(g("AMT_INCOME_TOTAL"))
-            except Exception:
-                pass
-            try:
-                r["ANNUITY_INCOME_RATIO"] = float(g("AMT_ANNUITY")) / float(g("AMT_INCOME_TOTAL"))
-            except Exception:
-                pass
-            try:
-                r["CREDIT_TERM_MONTHS"] = float(g("AMT_CREDIT")) / float(g("AMT_ANNUITY"))
-            except Exception:
-                pass
-            try:
-                r["PAYMENT_RATE"] = float(g("AMT_ANNUITY")) / float(g("AMT_CREDIT"))
-            except Exception:
-                pass
-            try:
-                r["CREDIT_GOODS_RATIO"] = float(g("AMT_CREDIT")) / float(g("AMT_GOODS_PRICE"))
-            except Exception:
-                pass
-
-            # Scores externes groupés
-            xs = []
-            na_count = 0
-            for k in ["EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3"]:
-                val = g(k)
-                if pd.notnull(val):
-                    xs.append(float(val))
-                else:
-                    na_count += 1
-            if xs:
-                r["EXT_SOURCES_MEAN"] = float(np.mean(xs))
-                r["EXT_SOURCES_SUM"]  = float(np.sum(xs))
-            r["EXT_SOURCES_NA"] = int(na_count)
-
-            # Ratios famille
-            try:
-                r["INCOME_PER_PERSON"] = float(g("AMT_INCOME_TOTAL")) / float(g("CNT_FAM_MEMBERS"))
-            except Exception:
-                pass
-            try:
-                r["CHILDREN_RATIO"] = float(g("CNT_CHILDREN")) / float(g("CNT_FAM_MEMBERS"))
-            except Exception:
-                pass
-
-            # Bool possession
-            vcar = g("FLAG_OWN_CAR")
-            if pd.notnull(vcar):
-                r["OWN_CAR_BOOL"] = 1 if str(vcar).upper() in {"Y", "TRUE", "1"} else 0
-            vrea = g("FLAG_OWN_REALTY")
-            if pd.notnull(vrea):
-                r["OWN_REALTY_BOOL"] = 1 if str(vrea).upper() in {"Y", "TRUE", "1"} else 0
-
-            # Emploi/Âge
-            if "EMPLOY_YEARS" in r and "AGE_YEARS" in r and r["AGE_YEARS"]:
                 try:
-                    r["EMPLOY_TO_AGE_RATIO"] = float(r["EMPLOY_YEARS"]) / float(r["AGE_YEARS"])
-                except Exception:
-                    pass
+                    p_all = mdl_local.predict_proba(X_all)[:, 1]
+                except Exception as e:
+                    st.error(f"Impossible de scorer l'échantillon : {e}")
+                    p_all = None
 
-            # Missing row count (sur colonnes présentes)
-            cols_present = [c for c in pool_df.columns if c not in {ID_COL, TARGET_COL}]
-            r["MISSING_COUNT_ROW"] = int(pd.isna(df_row[cols_present]).sum())
+                if p_all is not None:
+                    try:
+                        auc = roc_auc_score(y_all.values, p_all)
+                    except Exception:
+                        auc = float("nan")
 
-            return r
+                    try:
+                        fpr, tpr, _ = roc_curve(y_all.values, p_all)
+                        fig_roc = go.Figure()
+                        fig_roc.add_trace(go.Scatter(x=np.asarray(fpr, dtype=float),
+                                                     y=np.asarray(tpr, dtype=float),
+                                                     mode="lines", name=f"ROC (AUC={auc:.3f})"))
+                        fig_roc.add_trace(go.Scatter(x=np.asarray([0,1], dtype=float),
+                                                     y=np.asarray([0,1], dtype=float),
+                                                     mode="lines", name="Random", line=dict(dash="dash")))
+                        fig_roc.update_layout(title="Courbe ROC", xaxis_title="FPR", yaxis_title="TPR", height=350)
+                        st.plotly_chart(fig_roc, use_container_width=True)
+                        st.markdown("> **ROC & AUC** — Mesure la capacité du modèle à **séparer les défaillants des bons payeurs**. "
+                                    "Plus la courbe épouse le **coin en haut à gauche**, mieux c’est (AUC proche de 1).")
+                    except Exception:
+                        pass
 
-        # affichage client
-        if selected_id is None:
-            st.info("Sélectionnez d’abord un client.")
-        else:
-            base_row = pool_df.set_index(ID_COL).loc[selected_id]
-            ratios_cli = compute_ratios(base_row)
-            df_cli = pd.DataFrame([ratios_cli]).T.reset_index()
-            df_cli.columns = ["Ratio", "Valeur (client)"]
-            st.markdown("**Client sélectionné**")
-            st.dataframe(df_cli, use_container_width=True)
+                    try:
+                        prec, rec, _ = precision_recall_curve(y_all.values, p_all)
+                        fig_pr = go.Figure()
+                        fig_pr.add_trace(go.Scatter(x=np.asarray(rec, dtype=float),
+                                                    y=np.asarray(prec, dtype=float),
+                                                    mode="lines", name="Precision-Recall"))
+                        fig_pr.update_layout(title="Précision–Rappel", xaxis_title="Recall", yaxis_title="Precision", height=350)
+                        st.plotly_chart(fig_pr, use_container_width=True)
+                        st.markdown("> **Précision–Rappel** — Particulièrement utile quand la classe « défaut » est rare. "
+                                    "Plus la courbe est **en haut à droite**, mieux c’est (forte précision ET rappel).")
+                    except Exception:
+                        pass
 
-        # affichage nouveau client si dispo
-        st.markdown("---")
-        st.markdown("**Nouveau client (si saisi sur l’onglet dédié)**")
-        if "last_new_x" in st.session_state:
-            new_row = st.session_state["last_new_x"].iloc[0]
-            ratios_new = compute_ratios(new_row)
-            df_new = pd.DataFrame([ratios_new]).T.reset_index()
-            df_new.columns = ["Ratio", "Valeur (nouveau client)"]
-            st.dataframe(df_new, use_container_width=True)
-        else:
-            st.info("Aucun nouveau client saisi pour le moment.")
+                    df_cost, best = cost_curve(y_all.values, p_all, cost_fp, cost_fn, step=0.001)
+                    fig_cost = go.Figure()
+                    fig_cost.add_trace(go.Scatter(x=np.asarray(df_cost["threshold"].values, dtype=float),
+                                                  y=np.asarray(df_cost["cost"].values, dtype=float),
+                                                  mode="lines", name="Coût total"))
+                    fig_cost.add_vline(x=float(best["threshold"]), line_width=2, line_dash="dash", line_color="green",
+                                       annotation_text=f"Seuil optimal = {best['threshold']:.3f}",
+                                       annotation_position="top left")
+                    fig_cost.add_vline(x=float(st.session_state["threshold"]), line_width=2, line_dash="dot", line_color="red",
+                                       annotation_text=f"Seuil courant = {st.session_state['threshold']:.3f}",
+                                       annotation_position="top right")
+                    fig_cost.update_layout(title=f"Coût vs Seuil ({unit})", xaxis_title="Seuil", yaxis_title=f"Coût total ({unit})", height=350)
+                    st.plotly_chart(fig_cost, use_container_width=True)
+
+                    cur = cost_at_threshold(y_all.values, p_all, float(st.session_state["threshold"]), cost_fp, cost_fn)
+                    best_row = {
+                        "Seuil": f"{best['threshold']:.3f}",
+                        "Coût total": f"{best['cost']:.0f} {unit}",
+                        "TP": int(best["tp"]), "FP": int(best["fp"]), "FN": int(best["fn"]), "TN": int(best["tn"]),
+                        "Précision": f"{best['precision']:.3f}", "Rappel": f"{best['recall']:.3f}", "F1": f"{best['f1']:.3f}",
+                    }
+                    cur_row = {
+                        "Seuil": f"{st.session_state['threshold']:.3f}",
+                        "Coût total": f"{cur['cost']:.0f} {unit}",
+                        "TP": int(cur["tp"]), "FP": int(cur["fp"]), "FN": int(cur["fn"]), "TN": int(cur["tn"]),
+                        "Précision": f"{cur['precision']:.3f}", "Rappel": f"{cur['recall']:.3f}", "F1": f"{cur['f1']:.3f}",
+                    }
+                    st.markdown("**Synthèse**")
+                    st.dataframe(pd.DataFrame([best_row, cur_row], index=["Seuil optimal", "Seuil courant"]))
+
+                    cols_btn = st.columns([1, 4])
+                    with cols_btn[0]:
+                        st.button("✅ Appliquer le seuil optimal au dashboard", disabled=True)
+                    with cols_btn[1]:
+                        st.caption("Cette fonctionnalité sert à **appliquer automatiquement** le seuil optimal calculé "
+                                   "au **slider principal** du tableau de bord, pour **harmoniser la décision** en production. "
+                                   "Elle sera disponible **après le RETEX dans 6 mois**.")
 
 # Footer
 st.divider()
