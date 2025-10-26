@@ -1,9 +1,9 @@
-# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v0.9.0)
+# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v0.9.1)
 # ----------------------------------------------------------------
 # Run:
 #   python -m streamlit run dashboard_streamlit_app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true
 
-APP_VERSION = "0.9.0"
+APP_VERSION = "0.9.1"
 
 import os
 import json
@@ -41,6 +41,7 @@ except Exception:
 st.set_page_config(page_title="Prêt à dépenser — Credit Scoring", page_icon="💳", layout="wide")
 st.title("💳 Prêt à dépenser — Credit Scoring")
 st.caption("Transparence & explicabilité des décisions d’octroi")
+
 # -------------------------------
 # Runtime diagnostics
 # -------------------------------
@@ -259,7 +260,6 @@ def build_client_report_pdf(
         ]
     else:
         tbl = [["Probabilité de défaut", "—"], ["Seuil", f"{threshold:.3f}"], ["Décision", "—"], ["Niveau de risque", "—"]]
-    from reportlab.platypus import Table, TableStyle
     t = Table(tbl, hAlign="LEFT", colWidths=[7*cm, 7*cm])
     t.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
@@ -272,7 +272,6 @@ def build_client_report_pdf(
     story.append(Spacer(1, 8))
 
     story.append(Paragraph("Contributions locales (top 10)", styles["H2"]))
-    from reportlab.platypus import Table
     if shap_vals is not None and not shap_vals.empty:
         dfc = shap_vals.sort_values("abs_val", ascending=False).head(10).copy()
         dfc["effet"] = dfc["shap_value"].apply(lambda v: "↑ risque" if v > 0 else ("↓ risque" if v < 0 else "neutre"))
@@ -285,7 +284,6 @@ def build_client_report_pdf(
         t2 = Table(data, hAlign="LEFT", colWidths=[10*cm, 4*cm])
     else:
         t2 = Table([["Information", "Détail"], ["Explicabilité", "Indisponible"]], hAlign="LEFT", colWidths=[10*cm, 4*cm])
-    from reportlab.platypus import TableStyle
     t2.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
         ("BOX", (0,0), (-1,-1), 0.25, colors.black),
@@ -297,7 +295,7 @@ def build_client_report_pdf(
     story.append(t2)
     story.append(Spacer(1, 8))
 
-    story.append(Paragraph("Variables clés", styles["H2"]))
+    story.append(Paragraph("Variables clés", styles["H2"]]))
     if global_imp_df is not None and not global_imp_df.empty:
         keys = [f for f in global_imp_df["feature"].tolist() if f in X.columns][:20]
     else:
@@ -307,9 +305,7 @@ def build_client_report_pdf(
     for f in keys:
         v = row[f] if f in row.index else np.nan
         kv.append([str(f), "" if pd.isna(v) else str(v)])
-    from reportlab.platypus import Table
     t3 = Table(kv, hAlign="LEFT", colWidths=[9*cm, 5*cm])
-    from reportlab.platypus import TableStyle
     t3.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
         ("BOX", (0,0), (-1,-1), 0.25, colors.black),
@@ -337,10 +333,11 @@ def suggest_actions(
     """
     Retourne (axes_amelioration, points_forts).
     - Cas 1: SHAP dispo -> s'appuie sur shap_df (positif = ↑ risque, négatif = ↓ risque)
-    - Cas 2: SHAP indispo -> fallback basé sur importance globale + position vs médiane,
-             avec gestion NaN et filet de sécurité pour toujours proposer des axes.
+    - Cas 2: SHAP indispo -> fallback robuste basé sur importance globale + position vs médiane,
+             gère NaN/non-numériques et garantit au moins 2–3 axes.
     Chaque item = {"feature": str, "value": any, "note": str}
     """
+    # ---- utilitaires ----
     def _quantiles_for(f: str):
         s = None
         if f in pool_df.columns and pd.api.types.is_numeric_dtype(pool_df[f]):
@@ -369,8 +366,10 @@ def suggest_actions(
         if base:
             return base
         if q is None:
-            return "Contribution estimée vs profil moyen."
-        # Gère proprement NaN / non-numérique
+            return ("Valeur non directement comparable à la population. "
+                    "Se rapprocher d’un profil médian peut réduire le risque."
+                    if shap_pos else
+                    "Position réputée favorable vs profil médian estimé.")
         v_num = None
         try:
             v_num = float(val)
@@ -379,8 +378,7 @@ def suggest_actions(
         except Exception:
             v_num = None
         if v_num is None:
-            return ("Valeur non fournie/indisponible. "
-                    "Se rapprocher de la médiane (~{:.2f}) peut réduire le risque."
+            return ("Valeur non fournie/indisponible. Se rapprocher de la médiane (~{:.2f}) peut réduire le risque."
                     .format(q["p50"]) if shap_pos else
                     "Valeur non fournie/indisponible. Position supposée satisfaisante vs médiane (~{:.2f})."
                     .format(q["p50"]))
@@ -406,35 +404,42 @@ def suggest_actions(
         for _, r in neg.iterrows():
             f = str(r["feature"]); v = row[f] if f in row.index else np.nan; q = _quantiles_for(f)
             strong.append({"feature": f, "value": v, "note": _mk_note(f, v, False, q)})
+        # Filet : si aucune contrib positive (rare), basculer 2 features les + fortes en axes
+        if not axes and not tmp.empty:
+            for _, r in tmp.head(min(3, top_n)).iterrows():
+                f = str(r["feature"]); v = row[f] if f in row.index else np.nan; q = _quantiles_for(f)
+                axes.append({"feature": f, "value": v, "note": _mk_note(f, v, True, q)})
         return axes, strong
 
     # ===== Cas 2: Fallback sans SHAP =====
     axes, strong = [], []
-    if global_imp_df is None or global_imp_df.empty or new_x is None or new_x.empty:
+    if new_x is None or new_x.empty:
         return axes, strong
 
     row = new_x.iloc[0]
 
     # Heuristiques “direction du risque”
-    HIGH_IS_RISK = {"CREDIT_GOODS_RATIO","ANNUITY_INCOME_RATIO","CREDIT_INCOME_RATIO",
-                    "AMT_REQ_CREDIT_BUREAU_DAY","AMT_REQ_CREDIT_BUREAU_WEEK","AMT_REQ_CREDIT_BUREAU_MON",
-                    "AMT_REQ_CREDIT_BUREAU_QRT","AMT_REQ_CREDIT_BUREAU_YEAR","EXT_SOURCES_NA","DOC_COUNT"}
+    HIGH_IS_RISK = {
+        "CREDIT_GOODS_RATIO","ANNUITY_INCOME_RATIO","CREDIT_INCOME_RATIO",
+        "AMT_REQ_CREDIT_BUREAU_DAY","AMT_REQ_CREDIT_BUREAU_WEEK","AMT_REQ_CREDIT_BUREAU_MON",
+        "AMT_REQ_CREDIT_BUREAU_QRT","AMT_REQ_CREDIT_BUREAU_YEAR","EXT_SOURCES_NA","DOC_COUNT"
+    }
     LOW_IS_RISK  = {"EXT_SOURCES_MEAN","EXT_SOURCE_1","EXT_SOURCE_2","EXT_SOURCE_3","EMPLOY_TO_AGE_RATIO","PAYMENT_RATE"}
 
-    # Candidats depuis l’importance globale, sinon fallback sur colonnes numériques de X
-    cand = [f for f in (global_imp_df["feature"].tolist() if global_imp_df is not None else list(X.columns))
-            if (f in X.columns or f in pool_df.columns)]
-    if not cand:
-        cand = [f for f in list(X.columns)]
-    cand = cand[: max(top_n*4, 20)]  # un peu large
+    # Candidats : importance globale -> sinon colonnes numériques de X -> sinon toutes colonnes de X
+    if global_imp_df is not None and not global_imp_df.empty:
+        cand = [f for f in global_imp_df["feature"].tolist() if (f in X.columns or f in pool_df.columns or f in row.index)]
+    else:
+        cand = list(X.select_dtypes(include=[np.number]).columns)
+        if not cand:
+            cand = list(X.columns)
+    cand = cand[: max(top_n*4, 20)] or list(X.columns)
 
     scored = []
     for f in cand:
         q = _quantiles_for(f)
-        if q is None:
-            continue
         v = row[f] if f in row.index else np.nan
-        # v_num = None si NaN/non-numérique —> on garde quand même le feature
+        # numeric?
         v_num = None
         try:
             v_num = float(v)
@@ -442,29 +447,34 @@ def suggest_actions(
                 v_num = None
         except Exception:
             v_num = None
-        # Écart relatif à la médiane (0 si inconnu)
-        spread = max(q["p90"] - q["p10"], 1e-9)
-        deviation = (abs(v_num - q["p50"]) / spread) if (v_num is not None) else 0.0
-        # Direction de risque approximative
-        if f in HIGH_IS_RISK:
-            shap_pos_guess = True if v_num is None else (v_num >= q["p50"])
-        elif f in LOW_IS_RISK:
-            shap_pos_guess = True if v_num is None else (v_num <= q["p50"])
+        # écart relatif (si pas de quantiles, donner un poids moyen 0.5 pour garder le feature en lice)
+        if q is None:
+            deviation = 0.5
+            shap_pos_guess = (f in HIGH_IS_RISK)  # pencher côté "axe" si connu comme risqué
         else:
-            if v_num is None:
-                shap_pos_guess = False  # neutre si inconnu
+            spread = max(q["p90"] - q["p10"], 1e-9)
+            deviation = (abs(v_num - q["p50"]) / spread) if (v_num is not None) else 0.25
+            if f in HIGH_IS_RISK:
+                shap_pos_guess = True if v_num is None else (v_num >= q["p50"])
+            elif f in LOW_IS_RISK:
+                shap_pos_guess = True if v_num is None else (v_num <= q["p50"])
             else:
-                shap_pos_guess = (v_num > q["p90"] or v_num < q["p10"])
-        scored.append((f, v, q, deviation, shap_pos_guess))
+                if v_num is None:
+                    shap_pos_guess = False
+                else:
+                    shap_pos_guess = (v_num > q["p90"] or v_num < q["p10"])
+        # prioriser High risk
+        priority = 1 if f in HIGH_IS_RISK else (0 if f in LOW_IS_RISK else 0.5)
+        scored.append((f, v, q, deviation, shap_pos_guess, priority))
 
     if not scored:
         return axes, strong
 
-    # plus “éloignées” d’abord
-    scored.sort(key=lambda t: t[3], reverse=True)
+    # tri: d'abord priorité (HIGH), puis écart, puis nom pour stabilité
+    scored.sort(key=lambda t: (-t[5], -t[3], str(t[0])))
 
-    # Remplir axes & points forts
-    for f, v, q, _, shap_pos_guess in scored[:max(top_n, 10)]:
+    # Remplir axes/strong
+    for f, v, q, _, shap_pos_guess, _ in scored:
         item = {"feature": f, "value": v, "note": _mk_note(f, v, shap_pos_guess, q)}
         if shap_pos_guess and len(axes) < top_n:
             axes.append(item)
@@ -473,25 +483,27 @@ def suggest_actions(
         if len(axes) >= top_n and len(strong) >= top_n:
             break
 
-    # Filet de sécurité : garantir des axes
-    if not axes:
-        # 1) pousser des features “HIGH_IS_RISK” d’importance élevée
-        forced = []
-        for f, v, q, _, _ in scored:
+    # Filets de sécurité pour axes
+    min_axes = min(3, top_n)
+    if len(axes) < min_axes:
+        # compléter par HIGH_IS_RISK restants
+        for f, v, q, _, _, _ in scored:
+            if f in {a["feature"] for a in axes}:
+                continue
             if f in HIGH_IS_RISK:
-                forced.append({"feature": f, "value": v, "note": _mk_note(f, v, True, q)})
-            if len(forced) >= min(3, top_n):
+                axes.append({"feature": f, "value": v, "note": _mk_note(f, v, True, q)})
+            if len(axes) >= min_axes:
                 break
-        # 2) sinon prendre les premiers candidats restants
-        if not forced:
-            for f, v, q, _, _ in scored[:min(3, top_n)]:
-                forced.append({"feature": f, "value": v, "note": _mk_note(f, v, True, q)})
-        axes = forced
+    if len(axes) < min_axes:
+        # si toujours pas, prendre les premiers candidats restants avec note générique
+        for f, v, q, _, _, _ in scored:
+            if f in {a["feature"] for a in axes}:
+                continue
+            axes.append({"feature": f, "value": v, "note": _mk_note(f, v, True, q)})
+            if len(axes) >= min_axes:
+                break
 
     return axes, strong
-
-
-
 
 
 def build_new_client_report_pdf(
@@ -535,7 +547,8 @@ def build_new_client_report_pdf(
     story.append(Spacer(1, 6))
 
     # Score & décision
-    story.append(Paragraph("Score & décision", styles["H2"]))
+    story.append(Paragraph("Score & décision", styles["H2"])]
+    )
     if proba is not None:
         tbl = [
             ["Probabilité de défaut", f"{proba*100:.2f} %"],
@@ -638,7 +651,6 @@ GLOBIMP    = _pick_first_existing(["global_importance.csv"])
 INTERP_SUM = _pick_first_existing(["interpretability_summary.json"])
 
 with st.sidebar:
-
     # Diagnostics
     path, mtime_str, sha8, git = _runtime_info()
     st.caption(f"Fichier: {os.path.basename(path)}")
@@ -1084,7 +1096,6 @@ with main_tabs[5]:
                     new_p, shap_df2 = None, None
 
         if new_p is not None:
-            # Utilise le helper global défini plus haut
             band2, color2 = prob_to_band(float(new_p), low=0.05, high=0.15)
             decision = "Refus" if float(new_p) >= float(threshold) else "Accord"
 
@@ -1095,7 +1106,6 @@ with main_tabs[5]:
                 gauge={
                     "axis": {"range": [0, 100]},
                     "bar": {"color": color2},
-                    # Ombres comme sur l'onglet "Score & explication" pour matérialiser le seuil
                     "steps": [
                         {"range": [0, float(threshold) * 100.0], "color": "#ecf8f3"},
                         {"range": [float(threshold) * 100.0, 100], "color": "#fdecea"},
@@ -1105,10 +1115,9 @@ with main_tabs[5]:
             ))
             st.plotly_chart(fign, use_container_width=True)
 
-            # ➕ Ajouts : décision & rappel du seuil
             st.markdown(f"**Décision (seuil {float(threshold):.3f})** : **{decision}**")
             st.markdown(f"Niveau de risque : **{band2}**")
-            # ==== Recommandations & export PDF (nouveau client) ====
+
             used_fallback = (shap_df2 is None) or shap_df2.empty
             axes, strong = suggest_actions(shap_df2, new_x, X, pool_df, top_n=5, global_imp_df=global_imp_df)
 
@@ -1159,7 +1168,7 @@ with main_tabs[5]:
                 except Exception as e:
                     st.error(f"Échec génération PDF nouveau client : {e}")
 
-            # SHAP (inchangé)
+            # SHAP
             if shap_df2 is not None and not shap_df2.empty:
                 tmp = shap_df2.copy().sort_values("abs_val").tail(10)
                 x_vals = np.asarray(tmp["shap_value"].values, dtype=float)
@@ -1167,8 +1176,6 @@ with main_tabs[5]:
                 figb2 = go.Figure(go.Bar(x=x_vals, y=y_vals, orientation="h"))
                 figb2.update_layout(title="Contributions locales (SHAP) — top 10")
                 st.plotly_chart(figb2, use_container_width=True)
-
-
 
 # -------------------------------
 # Tab 7 — Seuil & coût métier
@@ -1186,7 +1193,6 @@ with main_tabs[6]:
         max_sample = st.number_input("Taille échantillon (max)", min_value=1000, value=20000, step=1000)
 
     if mode == "API FastAPI" and api_ok:
-        # >>> NOUVEAU : on appelle l'API /metrics
         try:
             payload = {"cost_fp": float(cost_fp), "cost_fn": float(cost_fn), "max_sample": int(max_sample), "step": 0.001}
             m = api_metrics(api_base, payload)
@@ -1196,7 +1202,6 @@ with main_tabs[6]:
             cc  = m.get("cost_curve", {})
             st.caption(f"Échantillon scoré côté API : **{m.get('n_scored', 0):,}** lignes")
 
-            # ROC
             if roc.get("fpr") and roc.get("tpr"):
                 fpr = np.asarray(roc["fpr"], dtype=float)
                 tpr = np.asarray(roc["tpr"], dtype=float)
@@ -1207,7 +1212,6 @@ with main_tabs[6]:
                 fig_roc.update_layout(title="Courbe ROC", xaxis_title="FPR", yaxis_title="TPR", height=350)
                 st.plotly_chart(fig_roc, use_container_width=True)
 
-            # PR
             if pr.get("precision") and pr.get("recall"):
                 prec = np.asarray(pr["precision"], dtype=float)
                 rec  = np.asarray(pr["recall"], dtype=float)
@@ -1216,7 +1220,6 @@ with main_tabs[6]:
                 fig_pr.update_layout(title="Précision–Rappel", xaxis_title="Recall", yaxis_title="Precision", height=350)
                 st.plotly_chart(fig_pr, use_container_width=True)
 
-            # Cost curve
             thr = np.asarray(cc.get("threshold", []), dtype=float)
             cst = np.asarray(cc.get("cost", []), dtype=float)
             best = cc.get("best", {})
@@ -1233,8 +1236,6 @@ with main_tabs[6]:
                                        yaxis_title=f"Coût total ({unit})", height=350)
                 st.plotly_chart(fig_cost, use_container_width=True)
 
-                # Tableau synthèse
-                cur = {"threshold": float(st.session_state["threshold"])}
                 st.markdown("**Synthèse (API)**")
                 best_row = {
                     "Seuil": f"{float(best.get('threshold', 0.0)):.3f}",
@@ -1257,7 +1258,6 @@ with main_tabs[6]:
             st.error(f"Échec récupération métriques API : {e}")
 
     else:
-        # Mode Local (comme avant)
         mdl_local = model_local
         if mdl_local is None or X.empty or TARGET_COL is None:
             st.info("Pour optimiser le seuil en local, il faut : un **modèle local**, des **données** et la colonne **TARGET**.")
