@@ -1,9 +1,9 @@
-# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v0.9.1)
+# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v0.9.2)
 # ----------------------------------------------------------------
 # Run:
 #   python -m streamlit run dashboard_streamlit_app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true
 
-APP_VERSION = "0.9.1"
+APP_VERSION = "0.9.2"
 
 import os
 import json
@@ -295,7 +295,7 @@ def build_client_report_pdf(
     story.append(t2)
     story.append(Spacer(1, 8))
 
-    story.append(Paragraph("Variables clés", styles["H2"]]))
+    story.append(Paragraph("Variables clés", styles["H2"]))
     if global_imp_df is not None and not global_imp_df.empty:
         keys = [f for f in global_imp_df["feature"].tolist() if f in X.columns][:20]
     else:
@@ -332,22 +332,18 @@ def suggest_actions(
 ) -> tuple[list[dict], list[dict]]:
     """
     Retourne (axes_amelioration, points_forts).
-    - Cas 1: SHAP dispo -> s'appuie sur shap_df (positif = ↑ risque, négatif = ↓ risque)
-    - Cas 2: SHAP indispo -> fallback robuste basé sur importance globale + position vs médiane,
-             gère NaN/non-numériques et garantit au moins 2–3 axes.
+    - Si SHAP dispo: axes = shap_value>0, points_forts = shap_value<0
+    - Sinon: fallback robuste basé sur importance globale + position vs médiane
+    -> Garantie: au moins 3 axes d'amélioration si possible.
     Chaque item = {"feature": str, "value": any, "note": str}
     """
-    # ---- utilitaires ----
-    def _quantiles_for(f: str):
-        s = None
-        if f in pool_df.columns and pd.api.types.is_numeric_dtype(pool_df[f]):
-            s = pool_df[f]
-        elif f in X.columns and pd.api.types.is_numeric_dtype(X[f]):
-            s = X[f]
-        if s is None or s.dropna().empty:
-            return None
-        q = s.quantile([0.1, 0.5, 0.9])
-        return {"p10": float(q.loc[0.1]), "p50": float(q.loc[0.5]), "p90": float(q.loc[0.9])}
+    # Règles simples
+    HIGH_IS_RISK = {
+        "CREDIT_GOODS_RATIO","ANNUITY_INCOME_RATIO","CREDIT_INCOME_RATIO",
+        "AMT_REQ_CREDIT_BUREAU_DAY","AMT_REQ_CREDIT_BUREAU_WEEK","AMT_REQ_CREDIT_BUREAU_MON",
+        "AMT_REQ_CREDIT_BUREAU_QRT","AMT_REQ_CREDIT_BUREAU_YEAR","EXT_SOURCES_NA","DOC_COUNT"
+    }
+    LOW_IS_RISK = {"EXT_SOURCES_MEAN","EXT_SOURCE_1","EXT_SOURCE_2","EXT_SOURCE_3","EMPLOY_TO_AGE_RATIO","PAYMENT_RATE"}
 
     RULES = {
         "CREDIT_GOODS_RATIO": "Un ratio crédit/biens plus faible (apport initial plus élevé) réduit le risque.",
@@ -361,145 +357,153 @@ def suggest_actions(
         "EMPLOY_TO_AGE_RATIO": "Un ratio emploi/âge plus élevé reflète une carrière plus stable.",
     }
 
-    def _mk_note(feat:str, val:Any, shap_pos:bool, q:Optional[dict]):
+    def _quantiles_for(f: str):
+        s = None
+        if f in pool_df.columns and pd.api.types.is_numeric_dtype(pool_df[f]):
+            s = pool_df[f]
+        elif f in X.columns and pd.api.types.is_numeric_dtype(X[f]):
+            s = X[f]
+        if s is None or s.dropna().empty:
+            return None
+        q = s.quantile([0.1, 0.5, 0.9])
+        return {"p10": float(q.loc[0.1]), "p50": float(q.loc[0.5]), "p90": float(q.loc[0.9])}
+
+    def _note(feat: str, val: Any, is_axis: bool, q: Optional[dict]) -> str:
         base = RULES.get(str(feat))
-        if base:
+        if base and is_axis:
             return base
-        if q is None:
-            return ("Valeur non directement comparable à la population. "
-                    "Se rapprocher d’un profil médian peut réduire le risque."
-                    if shap_pos else
-                    "Position réputée favorable vs profil médian estimé.")
-        v_num = None
+        vnum = None
         try:
-            v_num = float(val)
-            if not np.isfinite(v_num):
-                v_num = None
+            vnum = float(val)
+            if not np.isfinite(vnum):
+                vnum = None
         except Exception:
-            v_num = None
-        if v_num is None:
-            return ("Valeur non fournie/indisponible. Se rapprocher de la médiane (~{:.2f}) peut réduire le risque."
-                    .format(q["p50"]) if shap_pos else
-                    "Valeur non fournie/indisponible. Position supposée satisfaisante vs médiane (~{:.2f})."
+            vnum = None
+        if q is None:
+            return ("Se rapprocher d’un profil médian peut réduire le risque."
+                    if is_axis else "Position réputée favorable vs profil médian estimé.")
+        if vnum is None:
+            return ("Valeur indisponible. Viser la médiane (~{:.2f}) peut réduire le risque."
+                    .format(q["p50"]) if is_axis else "Valeur indisponible. Position supposée favorable (~{:.2f})."
                     .format(q["p50"]))
-        if shap_pos:
-            if v_num >= q["p50"]:
-                return f"Valeur au-dessus de la médiane ({q['p50']:.2f}). Se rapprocher de la médiane peut réduire le risque."
-            else:
-                return f"Valeur en-dessous de la médiane ({q['p50']:.2f}). Se rapprocher de la médiane peut réduire le risque."
+        if is_axis:
+            side = "au-dessus" if vnum >= q["p50"] else "en-dessous"
+            return f"Valeur {side} de la médiane ({q['p50']:.2f}). Se rapprocher de la médiane peut réduire le risque."
         else:
-            pos_txt = "au-dessus" if v_num >= q["p50"] else "en-dessous"
-            return f"Point fort : valeur {pos_txt} de la médiane ({q['p50']:.2f})."
+            side = "au-dessus" if vnum >= q["p50"] else "en-dessous"
+            return f"Point fort : valeur {side} de la médiane ({q['p50']:.2f})."
 
-    # ===== Cas 1: SHAP disponible =====
-    if shap_df is not None and not shap_df.empty and new_x is not None and not new_x.empty:
-        tmp = shap_df.copy().sort_values("abs_val", ascending=False)
-        pos = tmp[tmp["shap_value"] > 0].head(top_n)   # ↑ risque
-        neg = tmp[tmp["shap_value"] < 0].head(top_n)   # ↓ risque
-        axes, strong = [], []
-        row = new_x.iloc[0]
-        for _, r in pos.iterrows():
-            f = str(r["feature"]); v = row[f] if f in row.index else np.nan; q = _quantiles_for(f)
-            axes.append({"feature": f, "value": v, "note": _mk_note(f, v, True,  q)})
-        for _, r in neg.iterrows():
-            f = str(r["feature"]); v = row[f] if f in row.index else np.nan; q = _quantiles_for(f)
-            strong.append({"feature": f, "value": v, "note": _mk_note(f, v, False, q)})
-        # Filet : si aucune contrib positive (rare), basculer 2 features les + fortes en axes
-        if not axes and not tmp.empty:
-            for _, r in tmp.head(min(3, top_n)).iterrows():
-                f = str(r["feature"]); v = row[f] if f in row.index else np.nan; q = _quantiles_for(f)
-                axes.append({"feature": f, "value": v, "note": _mk_note(f, v, True, q)})
-        return axes, strong
-
-    # ===== Cas 2: Fallback sans SHAP =====
-    axes, strong = [], []
     if new_x is None or new_x.empty:
-        return axes, strong
+        return [], []
 
     row = new_x.iloc[0]
 
-    # Heuristiques “direction du risque”
-    HIGH_IS_RISK = {
-        "CREDIT_GOODS_RATIO","ANNUITY_INCOME_RATIO","CREDIT_INCOME_RATIO",
-        "AMT_REQ_CREDIT_BUREAU_DAY","AMT_REQ_CREDIT_BUREAU_WEEK","AMT_REQ_CREDIT_BUREAU_MON",
-        "AMT_REQ_CREDIT_BUREAU_QRT","AMT_REQ_CREDIT_BUREAU_YEAR","EXT_SOURCES_NA","DOC_COUNT"
-    }
-    LOW_IS_RISK  = {"EXT_SOURCES_MEAN","EXT_SOURCE_1","EXT_SOURCE_2","EXT_SOURCE_3","EMPLOY_TO_AGE_RATIO","PAYMENT_RATE"}
+    # ===== CAS 1 — SHAP dispo =====
+    if shap_df is not None and not shap_df.empty:
+        tmp = shap_df.copy().sort_values("abs_val", ascending=False)
+        pos = tmp[tmp["shap_value"] > 0].head(top_n)
+        neg = tmp[tmp["shap_value"] < 0].head(top_n)
+        axes, strong = [], []
+        for _, r in pos.iterrows():
+            f = str(r["feature"]); q = _quantiles_for(f)
+            v = row[f] if f in row.index else np.nan
+            axes.append({"feature": f, "value": v, "note": _note(f, v, True, q)})
+        for _, r in neg.iterrows():
+            f = str(r["feature"]); q = _quantiles_for(f)
+            v = row[f] if f in row.index else np.nan
+            strong.append({"feature": f, "value": v, "note": _note(f, v, False, q)})
+        # filet si pos vide
+        if not axes:
+            for _, r in tmp.head(min(3, top_n)).iterrows():
+                f = str(r["feature"]); q = _quantiles_for(f)
+                v = row[f] if f in row.index else np.nan
+                axes.append({"feature": f, "value": v, "note": _note(f, v, True, q)})
+        return axes, strong
 
-    # Candidats : importance globale -> sinon colonnes numériques de X -> sinon toutes colonnes de X
+    # ===== CAS 2 — Fallback sans SHAP =====
+    # Choix des candidats
     if global_imp_df is not None and not global_imp_df.empty:
-        cand = [f for f in global_imp_df["feature"].tolist() if (f in X.columns or f in pool_df.columns or f in row.index)]
+        cand = [f for f in global_imp_df["feature"].tolist() if f in X.columns or f in pool_df.columns or f in row.index]
     else:
-        cand = list(X.select_dtypes(include=[np.number]).columns)
-        if not cand:
-            cand = list(X.columns)
-    cand = cand[: max(top_n*4, 20)] or list(X.columns)
+        # défaut : variables numériques d'abord
+        num_cols = list(X.select_dtypes(include=[np.number]).columns)
+        cand = num_cols if num_cols else list(X.columns)
 
+    # garder un set raisonnable
+    cand = [c for c in cand if c in row.index][: max(40, top_n*6)] or list(row.index)
+
+    def _is_axis_feature(f: str, v: Any, q: Optional[dict]) -> bool:
+        # logique directionnelle simple
+        try:
+            vnum = float(v)
+            if not np.isfinite(vnum):
+                vnum = None
+        except Exception:
+            vnum = None
+        if q is None:  # pas de quantiles
+            return f in HIGH_IS_RISK  # penche côté "axe" sur variables réputées risquées
+        if f in HIGH_IS_RISK:
+            return vnum is None or vnum >= q["p50"]
+        if f in LOW_IS_RISK:
+            return vnum is None or vnum <= q["p50"]
+        if vnum is None:
+            return False
+        return (vnum >= q["p90"]) or (vnum <= q["p10"])
+
+    # scorer et remplir
     scored = []
     for f in cand:
         q = _quantiles_for(f)
-        v = row[f] if f in row.index else np.nan
-        # numeric?
-        v_num = None
-        try:
-            v_num = float(v)
-            if not np.isfinite(v_num):
-                v_num = None
-        except Exception:
-            v_num = None
-        # écart relatif (si pas de quantiles, donner un poids moyen 0.5 pour garder le feature en lice)
+        v = row[f]
+        # écart relatif pour prioriser
         if q is None:
             deviation = 0.5
-            shap_pos_guess = (f in HIGH_IS_RISK)  # pencher côté "axe" si connu comme risqué
         else:
-            spread = max(q["p90"] - q["p10"], 1e-9)
-            deviation = (abs(v_num - q["p50"]) / spread) if (v_num is not None) else 0.25
-            if f in HIGH_IS_RISK:
-                shap_pos_guess = True if v_num is None else (v_num >= q["p50"])
-            elif f in LOW_IS_RISK:
-                shap_pos_guess = True if v_num is None else (v_num <= q["p50"])
-            else:
-                if v_num is None:
-                    shap_pos_guess = False
-                else:
-                    shap_pos_guess = (v_num > q["p90"] or v_num < q["p10"])
-        # prioriser High risk
+            try:
+                vnum = float(v)
+                if not np.isfinite(vnum):
+                    raise ValueError()
+                spread = max(q["p90"] - q["p10"], 1e-9)
+                deviation = abs(vnum - q["p50"]) / spread
+            except Exception:
+                deviation = 0.25
         priority = 1 if f in HIGH_IS_RISK else (0 if f in LOW_IS_RISK else 0.5)
-        scored.append((f, v, q, deviation, shap_pos_guess, priority))
+        is_axis = _is_axis_feature(f, v, q)
+        scored.append((f, v, q, deviation, priority, is_axis))
 
-    if not scored:
-        return axes, strong
+    # tri: priorité (HIGH), écart, nom
+    scored.sort(key=lambda t: (-t[4], -t[3], str(t[0])))
 
-    # tri: d'abord priorité (HIGH), puis écart, puis nom pour stabilité
-    scored.sort(key=lambda t: (-t[5], -t[3], str(t[0])))
-
-    # Remplir axes/strong
-    for f, v, q, _, shap_pos_guess, _ in scored:
-        item = {"feature": f, "value": v, "note": _mk_note(f, v, shap_pos_guess, q)}
-        if shap_pos_guess and len(axes) < top_n:
+    axes: List[Dict[str, Any]] = []
+    strong: List[Dict[str, Any]] = []
+    for f, v, q, _, _, is_axis in scored:
+        item = {"feature": f, "value": v, "note": _note(f, v, is_axis, q)}
+        if is_axis and len(axes) < top_n:
             axes.append(item)
-        elif (not shap_pos_guess) and len(strong) < top_n:
+        elif (not is_axis) and len(strong) < top_n:
             strong.append(item)
         if len(axes) >= top_n and len(strong) >= top_n:
             break
 
-    # Filets de sécurité pour axes
+    # Garantie: au moins 3 axes
     min_axes = min(3, top_n)
     if len(axes) < min_axes:
-        # compléter par HIGH_IS_RISK restants
+        # compléter par features HIGH_IS_RISK restants
+        existing = {a["feature"] for a in axes}
         for f, v, q, _, _, _ in scored:
-            if f in {a["feature"] for a in axes}:
+            if f in existing:
                 continue
             if f in HIGH_IS_RISK:
-                axes.append({"feature": f, "value": v, "note": _mk_note(f, v, True, q)})
+                axes.append({"feature": f, "value": v, "note": _note(f, v, True, q)})
             if len(axes) >= min_axes:
                 break
     if len(axes) < min_axes:
-        # si toujours pas, prendre les premiers candidats restants avec note générique
+        # si toujours pas: prendre premiers candidats restants
+        existing = {a["feature"] for a in axes}
         for f, v, q, _, _, _ in scored:
-            if f in {a["feature"] for a in axes}:
+            if f in existing:
                 continue
-            axes.append({"feature": f, "value": v, "note": _mk_note(f, v, True, q)})
+            axes.append({"feature": f, "value": v, "note": _note(f, v, True, q)})
             if len(axes) >= min_axes:
                 break
 
@@ -539,16 +543,13 @@ def build_new_client_report_pdf(
     story.append(Paragraph(f"Date: {now} • App: {APP_VERSION}", styles["Small"]))
     story.append(Spacer(1, 8))
 
-    # Message demandé
     story.append(Paragraph(
         "Merci pour votre confiance. Voici vos résultats actuels et, en cas de refus, des axes d’amélioration possibles.",
         styles["Small"]
     ))
     story.append(Spacer(1, 6))
 
-    # Score & décision
-    story.append(Paragraph("Score & décision", styles["H2"])]
-    )
+    story.append(Paragraph("Score & décision", styles["H2"]))
     if proba is not None:
         tbl = [
             ["Probabilité de défaut", f"{proba*100:.2f} %"],
@@ -1354,7 +1355,7 @@ with main_tabs[6]:
                     with apply_cols[1]:
                         st.caption("Le seuil optimal minimise le coût total attendu : `coût = FP × coût_FP + FN × coût_FN`.")
 
-# Footer 
+# Footer
 st.divider()
 footer_cols = st.columns([2,2,1])
 with footer_cols[0]:
