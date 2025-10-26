@@ -1,9 +1,9 @@
-# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v0.9.1)
+# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v1.0.0)
 # ----------------------------------------------------------------
 # Run:
 #   python -m streamlit run dashboard_streamlit_app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true
 
-APP_VERSION = "0.9.1"
+APP_VERSION = "1.0.0"
 
 import os
 import json
@@ -136,19 +136,54 @@ def get_expected_input_columns(model) -> Optional[List[str]]:
         pass
     return None
 
-def compute_local_shap(estimator, X_background: pd.DataFrame, x_row: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-    import shap, pandas as pd, numpy as np
-    bg = X_background
-    if len(bg) > 200:
-        bg = bg.sample(200, random_state=42)
-    def f(Xdf):
-        if not isinstance(Xdf, pd.DataFrame):
-            Xdf = pd.DataFrame(Xdf, columns=list(bg.columns))
-        return estimator.predict_proba(Xdf)[:, 1]
-    masker = shap.maskers.Independent(bg)
-    explainer = shap.Explainer(f, masker, feature_names=list(bg.columns))
-    ex = explainer(x_row)
-    return np.array(ex.values).reshape(-1), np.array(ex.base_values).reshape(-1)
+# ====== SHAP local robuste (numérique uniquement, cat. fixées) ======
+def compute_local_shap(estimator, X_background: pd.DataFrame, x_row: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, List[str], np.ndarray]:
+    """
+    Explique localement en se restreignant aux colonnes numériques, en gardant toutes
+    les colonnes non-numériques fixées aux valeurs de x_row. Évite l'erreur isfinite().
+    Retourne: (shap_values, base_values, feature_names_used, feature_values_used)
+    """
+    import shap
+
+    # 1) Colonnes numériques uniquement pour l'explication
+    num_cols = [c for c in X_background.columns if pd.api.types.is_numeric_dtype(X_background[c])]
+    if len(num_cols) == 0:
+        raise ValueError("Aucune colonne numérique disponible pour SHAP local.")
+
+    # 2) Construire bg_num et x_row_num propres (float64, sans NaN/Inf)
+    bg_num = X_background[num_cols].copy()
+    bg_num = bg_num.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    bg_num = bg_num.fillna(bg_num.median(numeric_only=True))
+    x_row_num = x_row[num_cols].copy()
+    x_row_num = x_row_num.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    x_row_num = x_row_num.fillna(bg_num.median(numeric_only=True))
+
+    # 3) Valeur de référence complète (toutes colonnes) maintenue fixe pour les non-numériques
+    fixed_row_full = x_row.iloc[0].copy()
+    expected_cols = list(X_background.columns)
+    num_medians = bg_num.median(numeric_only=True)
+
+    def f_num(Xnum):
+        # Xnum (n, len(num_cols)) → reconstruire un DF complet pour l’estimateur
+        if not isinstance(Xnum, pd.DataFrame):
+            Xnum = pd.DataFrame(Xnum, columns=num_cols)
+        Xnum = Xnum.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+        Xnum = Xnum.fillna(num_medians)
+
+        n = len(Xnum)
+        # répéter la ligne complète (catégorielles fixées), puis écraser les colonnes num
+        Xfull = pd.DataFrame([fixed_row_full.values] * n, columns=expected_cols)
+        for c in num_cols:
+            Xfull[c] = Xnum[c].values
+        Xfull = Xfull[expected_cols]
+        return estimator.predict_proba(Xfull)[:, 1]
+
+    masker = shap.maskers.Independent(bg_num)
+    explainer = shap.Explainer(f_num, masker, feature_names=num_cols)
+    ex = explainer(x_row_num)
+    vals = np.array(ex.values).reshape(-1)
+    base_vals = np.array(ex.base_values).reshape(-1)
+    return vals, base_vals, num_cols, x_row_num.iloc[0].to_numpy()
 
 def get_quantile_series(feature: str, pool_df: pd.DataFrame, X: pd.DataFrame) -> Optional[pd.Series]:
     if feature in pool_df.columns and pd.api.types.is_numeric_dtype(pool_df[feature]):
@@ -337,10 +372,6 @@ def suggest_actions(
 ) -> tuple[list[dict], list[dict]]:
     """
     Retourne (axes_amelioration, points_forts), DÉDOUBLONNÉS par variable.
-    - Cas 1: SHAP dispo -> s'appuie sur shap_df (positif = ↑ risque, négatif = ↓ risque).
-    - Cas 2: SHAP indispo -> fallback basé sur importance globale + position vs médiane,
-             avec filet de sécurité.
-    Chaque item = {"feature": str, "value": any, "note": str}
     """
     def _quantiles_for(f: str):
         s = None
@@ -413,7 +444,6 @@ def suggest_actions(
             f = str(r["feature"]); v = row[f] if f in row.index else np.nan; q = _quantiles_for(f)
             strong.append({"feature": f, "value": v, "note": _mk_note(f, v, False, q)})
 
-        # Dédup + coupe au top_n
         axes = _unique_by_feature(axes)[:top_n]
         strong = [s for s in _unique_by_feature(strong) if s["feature"] not in {a["feature"] for a in axes}][:top_n]
         return axes, strong
@@ -434,7 +464,7 @@ def suggest_actions(
 
     scored = []
     for f in cand:
-        q = _quantiles_for(f)
+        q = get_quantile_series(f, pool_df, X)
         if q is None:
             continue
         v = row[f] if f in row.index else np.nan
@@ -442,15 +472,16 @@ def suggest_actions(
             v_float = float(v)
         except Exception:
             continue
-        spread = max(q["p90"] - q["p10"], 1e-9)
-        deviation = abs(v_float - q["p50"]) / spread
+        qv = q.quantile([0.1, 0.5, 0.9])
+        spread = max(float(qv.loc[0.9] - qv.loc[0.1]), 1e-9)
+        deviation = abs(v_float - float(qv.loc[0.5])) / spread
         if f in HIGH_IS_RISK:
-            shap_pos_guess = (v_float > q["p50"])   # ↑ risque si au-dessus médiane
+            shap_pos_guess = (v_float > float(qv.loc[0.5]))
         elif f in LOW_IS_RISK:
-            shap_pos_guess = (v_float < q["p50"])   # ↑ risque si en-dessous médiane
+            shap_pos_guess = (v_float < float(qv.loc[0.5]))
         else:
-            shap_pos_guess = (v_float > q["p90"] or v_float < q["p10"])
-        scored.append((f, v, q, deviation, shap_pos_guess))
+            shap_pos_guess = (v_float > float(qv.loc[0.9]) or v_float < float(qv.loc[0.1]))
+        scored.append((f, v, {"p10": float(qv.loc[0.1]), "p50": float(qv.loc[0.5]), "p90": float(qv.loc[0.9])}, deviation, shap_pos_guess))
 
     scored.sort(key=lambda t: t[3], reverse=True)
 
@@ -460,7 +491,6 @@ def suggest_actions(
         else:
             strong.append({"feature": f, "value": v, "note": _mk_note(f, v, False, q)})
 
-    # Filet de sécurité si aucun axe
     if not axes:
         forced = []
         for f, v, q, _, _ in scored:
@@ -477,7 +507,6 @@ def suggest_actions(
                 forced.append({"feature": f, "value": v, "note": _mk_note(f, v, True, q)})
         axes = forced
 
-    # Dédup stricte : retirer des points forts toute variable déjà en axes
     axes = _unique_by_feature(axes)[:top_n]
     strong = [s for s in _unique_by_feature(strong) if s["feature"] not in {a["feature"] for a in axes}][:top_n]
 
@@ -544,7 +573,6 @@ def build_new_client_report_pdf(
     story.append(t)
     story.append(Spacer(1, 8))
 
-    # Axes / Points forts dédupliqués
     axes, strong = suggest_actions(shap_df, new_x, X, pool_df, top_n=5, global_imp_df=global_imp_df)
 
     story.append(Paragraph("Axes d’amélioration (si décision = Refus)", styles["H2"]))
@@ -805,12 +833,12 @@ with main_tabs[0]:
             shap_enabled = st.toggle("Activer SHAP local (expérimental)", value=False)
             if shap_enabled and not background.empty and model_local is not None:
                 try:
-                    vals, base_vals = compute_local_shap(model_local, background, x_row)
+                    vals, base_vals, feats, feat_vals = compute_local_shap(model_local, background, x_row)
                     shap_df_local = pd.DataFrame({
-                        "feature": list(X.columns),
+                        "feature": feats,
                         "shap_value": vals,
                         "abs_val": np.abs(vals),
-                        "value": x_row.iloc[0].values,
+                        "value": feat_vals,
                     }).sort_values("abs_val", ascending=False)
                     st.plotly_chart(_bar_from_df(shap_df_local, "Impact sur le score (positif = ↑ risque)"),
                                     use_container_width=True)
@@ -1061,12 +1089,12 @@ with main_tabs[5]:
                 try:
                     new_p = float(model_local.predict_proba(new_x)[0, 1])
                     try:
-                        vals, _ = compute_local_shap(model_local, background, new_x)
+                        vals, _, feats, feat_vals = compute_local_shap(model_local, background, new_x)
                         shap_df2 = pd.DataFrame({
-                            "feature": list(X.columns),
+                            "feature": feats,
                             "shap_value": vals,
                             "abs_val": np.abs(vals),
-                            "value": new_x.iloc[0].values,
+                            "value": feat_vals,
                         }).sort_values("abs_val", ascending=False).head(10)
                     except Exception:
                         shap_df2 = None
@@ -1103,7 +1131,6 @@ with main_tabs[5]:
             if used_fallback:
                 st.info("Explicabilité locale indisponible ; recommandations basées sur l’importance globale.")
 
-            # Afficher AXES uniquement si Refus ; sinon message explicite
             if decision == "Refus":
                 with st.expander("🛠️ Axes d’amélioration (si décision = Refus)", expanded=True):
                     if axes:
@@ -1175,7 +1202,7 @@ with main_tabs[6]:
     with cols_opt[3]:
         max_sample = st.number_input("Taille échantillon (max)", min_value=1000, value=20000, step=1000)
 
-    if mode == "API FastAPI" and api_ok:
+    if mode == "API FastAPI" && api_ok:
         try:
             payload = {"cost_fp": float(cost_fp), "cost_fn": float(cost_fn), "max_sample": int(max_sample), "step": 0.001}
             m = api_metrics(api_base, payload)
