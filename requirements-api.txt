@@ -1,8 +1,9 @@
+# API only (pas de SHAP, pas de Plotly, etc.)
 fastapi>=0.110,<1
 uvicorn[standard]>=0.30,<0.31
 pydantic>=2.7,<3
-joblib>=1.3,<2
 numpy==1.26.4
-pandas==2.2.2
+scipy==1.12.0
 scikit-learn==1.4.2
-# shap==0.44.1   # <- ajoute-le plus tard si tu veux du SHAP côté serveur
+pandas>=2.2,<3
+joblib>=1.3,<2
