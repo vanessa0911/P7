@@ -1,14 +1,18 @@
 FROM mcr.microsoft.com/devcontainers/python:3.12
 
-# Lib système requise par scikit-learn / SciPy (OpenMP)
-RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Lib système nécessaire à scikit-learn / scipy
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libgomp1 \
  && rm -rf /var/lib/apt/lists/*
 
-# Symlink de compatibilité (certains wheels scikit-learn attendent ce nom précis)
+# Symlink de compatibilité (selon les builds scikit-learn)
 RUN if [ ! -f /usr/lib/x86_64-linux-gnu/libgomp-a34b3233.so.1.0.0 ] && [ -f /usr/lib/x86_64-linux-gnu/libgomp.so.1 ]; then \
       ln -s /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib/x86_64-linux-gnu/libgomp-a34b3233.so.1.0.0 ; \
     fi
 
-# Dépendances Python
+# Installer les deps Python
 COPY requirements.txt /tmp/requirements.txt
-RUN pip install -U pip && pip install --no-cache-dir -r /tmp/requirements.txt
+RUN pip install -U pip \
+ && pip install --no-cache-dir -r /tmp/requirements.txt
