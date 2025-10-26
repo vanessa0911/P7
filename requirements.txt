@@ -1,23 +1,23 @@
-streamlit>=1.31,<2
-pandas>=2.2
-scikit-learn>=1.4
-joblib>=1.3
-pyarrow>=16
-catboost>=1.2
-fastapi>=0.110
-uvicorn[standard]>=0.23
-pydantic>=2
-requests>=2.31
-reportlab>=4.2.2
-narwhals>=1.0.0
-fastapi>=0.115
-uvicorn>=0.30
-pydantic>=2.7
-reportlab>=4.2.2
-scikit-learn
+# --- Core data stack (versions testées entre elles, Py3.12) ---
 numpy==1.26.4
 scipy==1.11.4
+pandas>=2.2,<3
+scikit-learn==1.4.2
+joblib>=1.3,<2
+pyarrow>=16,<17
+
+# --- Modeling / explainability ---
 shap==0.44.1
-requests
-reportlab
+catboost>=1.2,<2
+
+# --- App & API ---
+streamlit>=1.31,<2
 plotly>=5.20,<6
+fastapi>=0.110,<1
+uvicorn[standard]>=0.30,<0.31
+pydantic>=2.7,<3
+requests>=2.31,<3
+reportlab>=4.2.2,<5
+
+# --- Utils (si utilisé dans le code) ---
+narwhals>=1.0.0,<2
