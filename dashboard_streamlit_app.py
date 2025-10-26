@@ -922,7 +922,12 @@ with main_tabs[2]:
         cohort_df = pool_df.copy()
         for c in selected_cohorts:
             cohort_df = cohort_df[cohort_df[c] == pool_df.loc[pool_df[ID_COL] == selected_id, c].iloc[0]]
-        st.caption(f"Taille de la cohorte similaire : **{len(cohort_df):,}**")
+        def _fmt_fr_int(n: int) -> str:
+        # remplace la virgule des milliers par une espace fine insécable
+        return f"{n:,}".replace(",", " ")
+    
+        st.caption(f"Taille de la cohorte similaire : **{_fmt_fr_int(len(cohort_df))}** dossiers")
+
 
         if global_imp_df is not None and not global_imp_df.empty:
             cand = [f for f in global_imp_df["feature"].tolist() if (f in X.columns or f in pool_df.columns)]
