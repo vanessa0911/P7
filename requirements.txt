@@ -1,18 +1,21 @@
 # --- Core data stack (versions testées entre elles, Py3.12) ---
 numpy==1.26.4
-scipy==1.11.4
+scipy==1.12
+scipy-openblas>=0.3.21,<0.4
+scikit-learn==1.4.2
 pandas>=2.2,<3
 scikit-learn==1.4.2
 joblib>=1.3,<2
 pyarrow>=16,<17
+threadpoolctl==3.5.0
 
 # --- Modeling / explainability ---
 shap==0.44.1
 catboost>=1.2,<2
 
 # --- App & API ---
-streamlit>=1.31,<2
-plotly>=5.20,<6
+plotly==5.22.0
+streamlit==1.37.0
 fastapi>=0.110,<1
 uvicorn[standard]>=0.30,<0.31
 pydantic>=2.7,<3
