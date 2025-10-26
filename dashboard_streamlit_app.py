@@ -337,7 +337,8 @@ def suggest_actions(
     """
     Retourne (axes_amelioration, points_forts).
     - Cas 1: SHAP dispo -> s'appuie sur shap_df (positif = ↑ risque, négatif = ↓ risque)
-    - Cas 2: SHAP indispo -> fallback basé sur importance globale + position vs médiane
+    - Cas 2: SHAP indispo -> fallback basé sur importance globale + position vs médiane,
+             avec un filet de sécurité pour toujours proposer quelques axes.
     Chaque item = {"feature": str, "value": any, "note": str}
     """
     def _quantiles_for(f: str):
@@ -369,11 +370,10 @@ def suggest_actions(
             return base
         if q is None:
             return "Contribution estimée vs profil moyen."
-        v = None
         try:
             v = float(val)
         except Exception:
-            pass
+            v = None
         if v is None:
             return "Contribution liée à la modalité observée."
         if shap_pos:
@@ -386,17 +386,17 @@ def suggest_actions(
             pos_txt = "au-dessus" if v >= q["p50"] else "en-dessous"
             return f"Point fort : valeur {pos_txt} de la médiane ({q['p50']:.2f})."
 
-    # ===== Cas 1: on a des SHAP =====
-    if shap_df is not None and not shap_df.empty:
+    # ===== Cas 1: SHAP disponible =====
+    if shap_df is not None and not shap_df.empty and not new_x.empty:
         tmp = shap_df.copy().sort_values("abs_val", ascending=False)
         pos = tmp[tmp["shap_value"] > 0].head(top_n)   # ↑ risque
         neg = tmp[tmp["shap_value"] < 0].head(top_n)   # ↓ risque
         axes, strong = [], []
-        row = new_x.iloc[0] if not new_x.empty else pd.Series(dtype=object)
+        row = new_x.iloc[0]
 
         for _, r in pos.iterrows():
             f = str(r["feature"]); v = row[f] if f in row.index else np.nan; q = _quantiles_for(f)
-            axes.append({"feature": f, "value": v, "note": _mk_note(f, v, shap_pos=True, q=q)})
+            axes.append({"feature": f, "value": v, "note": _mk_note(f, v, shap_pos=True,  q=q)})
 
         for _, r in neg.iterrows():
             f = str(r["feature"]); v = row[f] if f in row.index else np.nan; q = _quantiles_for(f)
@@ -404,20 +404,20 @@ def suggest_actions(
 
         return axes, strong
 
-    # ===== Cas 2: Fallback sans SHAP (importance globale) =====
+    # ===== Cas 2: Fallback sans SHAP =====
     axes, strong = [], []
     if global_imp_df is None or global_imp_df.empty or new_x.empty:
         return axes, strong
 
     row = new_x.iloc[0]
-    # Petits heuristiques de direction du risque par nom de variable
+    # Heuristiques de direction du risque par nom de variable
     HIGH_IS_RISK = {"CREDIT_GOODS_RATIO", "ANNUITY_INCOME_RATIO", "CREDIT_INCOME_RATIO",
                     "AMT_REQ_CREDIT_BUREAU_DAY","AMT_REQ_CREDIT_BUREAU_WEEK","AMT_REQ_CREDIT_BUREAU_MON",
                     "AMT_REQ_CREDIT_BUREAU_QRT","AMT_REQ_CREDIT_BUREAU_YEAR","EXT_SOURCES_NA","DOC_COUNT"}
     LOW_IS_RISK  = {"EXT_SOURCES_MEAN","EXT_SOURCE_1","EXT_SOURCE_2","EXT_SOURCE_3","EMPLOY_TO_AGE_RATIO","PAYMENT_RATE"}
 
     cand = [f for f in global_imp_df["feature"].tolist() if (f in X.columns or f in pool_df.columns)]
-    cand = cand[: max(top_n*3, 15)]  # on prend un peu large puis on trie
+    cand = cand[: max(top_n*3, 15)]  # un peu large puis on trie
 
     scored = []
     for f in cand:
@@ -433,23 +433,42 @@ def suggest_actions(
         deviation = abs(v_float - q["p50"]) / spread  # écart relatif
         # direction de risque approximative
         if f in HIGH_IS_RISK:
-            shap_pos_guess = (v_float > q["p50"])
+            shap_pos_guess = (v_float > q["p50"])   # ↑ risque si au-dessus de la médiane
         elif f in LOW_IS_RISK:
-            shap_pos_guess = (v_float < q["p50"])
+            shap_pos_guess = (v_float < q["p50"])   # ↑ risque si en-dessous de la médiane
         else:
             shap_pos_guess = (v_float > q["p90"] or v_float < q["p10"])
         scored.append((f, v, q, deviation, shap_pos_guess))
 
-    # on prend les plus “éloignées” d’abord
+    # plus “éloignées” d’abord
     scored.sort(key=lambda t: t[3], reverse=True)
 
+    # Remplir axes & points forts selon l’heuristique
     for f, v, q, _, shap_pos_guess in scored[:top_n]:
         if shap_pos_guess:
-            axes.append({"feature": f, "value": v, "note": _mk_note(f, v, True, q)})
+            axes.append({"feature": f, "value": v, "note": _mk_note(f, v, True,  q)})
         else:
             strong.append({"feature": f, "value": v, "note": _mk_note(f, v, False, q)})
 
+    # 🔸 FILET DE SÉCURITÉ : si aucun axe trouvé (ex: valeurs ≈ médiane),
+    #    on force 2–3 recommandations prioritaires basées sur les règles
+    if not axes:
+        forced = []
+        # 1) d’abord, essayer les features “à risque” côté médiane (>= pour HIGH, <= pour LOW)
+        for f, v, q, _, _ in scored:
+            if (f in HIGH_IS_RISK and float(v) >= q["p50"]) or (f in LOW_IS_RISK and float(v) <= q["p50"]):
+                forced.append({"feature": f, "value": v, "note": _mk_note(f, v, True, q)})
+                if len(forced) >= min(3, top_n):
+                    break
+        # 2) si toujours rien, prendre les 2–3 plus importantes avec note générique
+        if not forced:
+            for f, v, q, _, _ in scored[:min(3, top_n)]:
+                forced.append({"feature": f, "value": v, "note": _mk_note(f, v, True, q)})
+
+        axes = forced
+
     return axes, strong
+
 
 
 
