@@ -1,6 +1,6 @@
-# API only – versions pinées avec wheels manylinux
+# requirements-api.txt — pour Render (API uniquement)
 fastapi==0.110.2
-uvicorn==0.30.5          # <-- SANS [standard]
+uvicorn==0.30.5
 pydantic==2.7.4
 
 numpy==1.26.4
