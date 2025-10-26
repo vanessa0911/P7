@@ -1,9 +1,9 @@
-# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v0.9.2)
+# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v0.9.6)
 # ----------------------------------------------------------------
 # Run:
 #   python -m streamlit run dashboard_streamlit_app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true
 
-APP_VERSION = "0.9.2"
+APP_VERSION = "0.9.6"
 
 import os
 import json
@@ -136,20 +136,6 @@ def get_expected_input_columns(model) -> Optional[List[str]]:
         pass
     return None
 
-def compute_local_shap(estimator, X_background: pd.DataFrame, x_row: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-    import shap, pandas as pd, numpy as np
-    bg = X_background
-    if len(bg) > 200:
-        bg = bg.sample(200, random_state=42)
-    def f(Xdf):
-        if not isinstance(Xdf, pd.DataFrame):
-            Xdf = pd.DataFrame(Xdf, columns=list(bg.columns))
-        return estimator.predict_proba(Xdf)[:, 1]
-    masker = shap.maskers.Independent(bg)
-    explainer = shap.Explainer(f, masker, feature_names=list(bg.columns))
-    ex = explainer(x_row)
-    return np.array(ex.values).reshape(-1), np.array(ex.base_values).reshape(-1)
-
 def get_quantile_series(feature: str, pool_df: pd.DataFrame, X: pd.DataFrame) -> Optional[pd.Series]:
     if feature in pool_df.columns and pd.api.types.is_numeric_dtype(pool_df[feature]):
         return pool_df[feature]
@@ -230,7 +216,7 @@ def build_client_report_pdf(
     X: pd.DataFrame,
     pool_df: pd.DataFrame,
     global_imp_df: Optional[pd.DataFrame],
-    shap_vals: Optional[pd.DataFrame] = None,
+    shap_vals: Optional[pd.DataFrame] = None,   # gardé pour compat, non utilisé ici
 ) -> bytes:
     if not REPORTLAB_AVAILABLE:
         return b""
@@ -271,24 +257,18 @@ def build_client_report_pdf(
     story.append(t)
     story.append(Spacer(1, 8))
 
-    story.append(Paragraph("Contributions locales (top 10)", styles["H2"]))
-    if shap_vals is not None and not shap_vals.empty:
-        dfc = shap_vals.sort_values("abs_val", ascending=False).head(10).copy()
-        dfc["effet"] = dfc["shap_value"].apply(lambda v: "↑ risque" if v > 0 else ("↓ risque" if v < 0 else "neutre"))
-        data = [["Variable", "Valeur", "Contribution", "Effet"]] + \
-               [[str(r["feature"]), str(r["value"]), f'{r["shap_value"]:+.4f}', r["effet"]] for _, r in dfc.iterrows()]
-        t2 = Table(data, hAlign="LEFT", colWidths=[7*cm, 3.5*cm, 3.5*cm, 2*cm])
-    elif global_imp_df is not None and not global_imp_df.empty:
+    story.append(Paragraph("Importance globale (top 10)", styles["H2"]))
+    if global_imp_df is not None and not global_imp_df.empty:
         dfc = global_imp_df.head(10)
         data = [["Variable", "Importance"]] + [[str(r["feature"]), f'{r["importance"]:.4f}'] for _, r in dfc.iterrows()]
         t2 = Table(data, hAlign="LEFT", colWidths=[10*cm, 4*cm])
     else:
-        t2 = Table([["Information", "Détail"], ["Explicabilité", "Indisponible"]], hAlign="LEFT", colWidths=[10*cm, 4*cm])
+        t2 = Table([["Information", "Détail"], ["Importance globale", "Indisponible"]], hAlign="LEFT", colWidths=[10*cm, 4*cm])
     t2.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
         ("BOX", (0,0), (-1,-1), 0.25, colors.black),
         ("INNERGRID", (0,0), (-1,-1), 0.25, colors.grey),
-        ("ALIGN", (2,1), (2,-1), "RIGHT"),
+        ("ALIGN", (1,1), (1,-1), "RIGHT"),
         ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
         ("FONTSIZE", (0,0), (-1,-1), 9),
     ]))
@@ -321,9 +301,8 @@ def build_client_report_pdf(
     buf.close()
     return pdf_bytes
 
-# ---- Suggestions "nouveau client" ----
+# ---- Suggestions "nouveau client" — sans SHAP, robustes
 def suggest_actions(
-    shap_df: Optional[pd.DataFrame],
     new_x: pd.DataFrame,
     X: pd.DataFrame,
     pool_df: pd.DataFrame,
@@ -331,19 +310,19 @@ def suggest_actions(
     global_imp_df: Optional[pd.DataFrame] = None,
 ) -> tuple[list[dict], list[dict]]:
     """
-    Retourne (axes_amelioration, points_forts).
-    - Si SHAP dispo: axes = shap_value>0, points_forts = shap_value<0
-    - Sinon: fallback robuste basé sur importance globale + position vs médiane
-    -> Garantie: au moins 3 axes d'amélioration si possible.
-    Chaque item = {"feature": str, "value": any, "note": str}
+    Retourne (axes_amelioration, points_forts) — garantit >= 3 axes si possible.
+    Logique: importance globale + position vs médiane (p50), heuristiques directionnelles.
     """
-    # Règles simples
+    if new_x is None or new_x.empty:
+        return [], []
+
+    # Heuristiques directionnelles simples (à adapter si besoin)
     HIGH_IS_RISK = {
         "CREDIT_GOODS_RATIO","ANNUITY_INCOME_RATIO","CREDIT_INCOME_RATIO",
         "AMT_REQ_CREDIT_BUREAU_DAY","AMT_REQ_CREDIT_BUREAU_WEEK","AMT_REQ_CREDIT_BUREAU_MON",
         "AMT_REQ_CREDIT_BUREAU_QRT","AMT_REQ_CREDIT_BUREAU_YEAR","EXT_SOURCES_NA","DOC_COUNT"
     }
-    LOW_IS_RISK = {"EXT_SOURCES_MEAN","EXT_SOURCE_1","EXT_SOURCE_2","EXT_SOURCE_3","EMPLOY_TO_AGE_RATIO","PAYMENT_RATE"}
+    LOW_IS_RISK  = {"EXT_SOURCES_MEAN","EXT_SOURCE_1","EXT_SOURCE_2","EXT_SOURCE_3","EMPLOY_TO_AGE_RATIO","PAYMENT_RATE"}
 
     RULES = {
         "CREDIT_GOODS_RATIO": "Un ratio crédit/biens plus faible (apport initial plus élevé) réduit le risque.",
@@ -393,66 +372,20 @@ def suggest_actions(
             side = "au-dessus" if vnum >= q["p50"] else "en-dessous"
             return f"Point fort : valeur {side} de la médiane ({q['p50']:.2f})."
 
-    if new_x is None or new_x.empty:
-        return [], []
-
     row = new_x.iloc[0]
 
-    # ===== CAS 1 — SHAP dispo =====
-    if shap_df is not None and not shap_df.empty:
-        tmp = shap_df.copy().sort_values("abs_val", ascending=False)
-        pos = tmp[tmp["shap_value"] > 0].head(top_n)
-        neg = tmp[tmp["shap_value"] < 0].head(top_n)
-        axes, strong = [], []
-        for _, r in pos.iterrows():
-            f = str(r["feature"]); q = _quantiles_for(f)
-            v = row[f] if f in row.index else np.nan
-            axes.append({"feature": f, "value": v, "note": _note(f, v, True, q)})
-        for _, r in neg.iterrows():
-            f = str(r["feature"]); q = _quantiles_for(f)
-            v = row[f] if f in row.index else np.nan
-            strong.append({"feature": f, "value": v, "note": _note(f, v, False, q)})
-        # filet si pos vide
-        if not axes:
-            for _, r in tmp.head(min(3, top_n)).iterrows():
-                f = str(r["feature"]); q = _quantiles_for(f)
-                v = row[f] if f in row.index else np.nan
-                axes.append({"feature": f, "value": v, "note": _note(f, v, True, q)})
-        return axes, strong
-
-    # ===== CAS 2 — Fallback sans SHAP =====
-    # Choix des candidats
+    # Candidats : importance globale si dispo, sinon colonnes numériques
     if global_imp_df is not None and not global_imp_df.empty:
-        cand = [f for f in global_imp_df["feature"].tolist() if f in X.columns or f in pool_df.columns or f in row.index]
+        cand = [f for f in global_imp_df["feature"].tolist() if f in row.index]
     else:
-        # défaut : variables numériques d'abord
         num_cols = list(X.select_dtypes(include=[np.number]).columns)
-        cand = num_cols if num_cols else list(X.columns)
+        cand = [f for f in num_cols if f in row.index]
+    if not cand:
+        cand = list(row.index)
 
-    # garder un set raisonnable
-    cand = [c for c in cand if c in row.index][: max(40, top_n*6)] or list(row.index)
-
-    def _is_axis_feature(f: str, v: Any, q: Optional[dict]) -> bool:
-        # logique directionnelle simple
-        try:
-            vnum = float(v)
-            if not np.isfinite(vnum):
-                vnum = None
-        except Exception:
-            vnum = None
-        if q is None:  # pas de quantiles
-            return f in HIGH_IS_RISK  # penche côté "axe" sur variables réputées risquées
-        if f in HIGH_IS_RISK:
-            return vnum is None or vnum >= q["p50"]
-        if f in LOW_IS_RISK:
-            return vnum is None or vnum <= q["p50"]
-        if vnum is None:
-            return False
-        return (vnum >= q["p90"]) or (vnum <= q["p10"])
-
-    # scorer et remplir
+    # Pré-score pour priorisation
     scored = []
-    for f in cand:
+    for f in cand[: max(60, top_n*6)]:
         q = _quantiles_for(f)
         v = row[f]
         # écart relatif pour prioriser
@@ -468,15 +401,34 @@ def suggest_actions(
             except Exception:
                 deviation = 0.25
         priority = 1 if f in HIGH_IS_RISK else (0 if f in LOW_IS_RISK else 0.5)
-        is_axis = _is_axis_feature(f, v, q)
-        scored.append((f, v, q, deviation, priority, is_axis))
+        scored.append((f, v, q, deviation, priority))
 
-    # tri: priorité (HIGH), écart, nom
     scored.sort(key=lambda t: (-t[4], -t[3], str(t[0])))
 
     axes: List[Dict[str, Any]] = []
     strong: List[Dict[str, Any]] = []
-    for f, v, q, _, _, is_axis in scored:
+
+    for f, v, q, _, _ in scored:
+        # Décision axe/point fort
+        is_axis = False
+        try:
+            vnum = float(v); _finite = np.isfinite(vnum)
+        except Exception:
+            vnum, _finite = None, False
+
+        if q is None:
+            is_axis = f in HIGH_IS_RISK
+        else:
+            if f in HIGH_IS_RISK:
+                is_axis = (vnum is None) or (vnum >= q["p50"])
+            elif f in LOW_IS_RISK:
+                is_axis = (vnum is None) or (vnum <= q["p50"])
+            else:
+                if vnum is None:
+                    is_axis = False
+                else:
+                    is_axis = (vnum >= q["p90"]) or (vnum <= q["p10"])
+
         item = {"feature": f, "value": v, "note": _note(f, v, is_axis, q)}
         if is_axis and len(axes) < top_n:
             axes.append(item)
@@ -485,12 +437,11 @@ def suggest_actions(
         if len(axes) >= top_n and len(strong) >= top_n:
             break
 
-    # Garantie: au moins 3 axes
+    # Filet de sécurité : au moins 3 axes si possible
     min_axes = min(3, top_n)
     if len(axes) < min_axes:
-        # compléter par features HIGH_IS_RISK restants
         existing = {a["feature"] for a in axes}
-        for f, v, q, _, _, _ in scored:
+        for f, v, q, _, _ in scored:
             if f in existing:
                 continue
             if f in HIGH_IS_RISK:
@@ -498,9 +449,8 @@ def suggest_actions(
             if len(axes) >= min_axes:
                 break
     if len(axes) < min_axes:
-        # si toujours pas: prendre premiers candidats restants
         existing = {a["feature"] for a in axes}
-        for f, v, q, _, _, _ in scored:
+        for f, v, q, _, _ in scored:
             if f in existing:
                 continue
             axes.append({"feature": f, "value": v, "note": _note(f, v, True, q)})
@@ -508,7 +458,6 @@ def suggest_actions(
                 break
 
     return axes, strong
-
 
 def build_new_client_report_pdf(
     proba: Optional[float],
@@ -519,9 +468,8 @@ def build_new_client_report_pdf(
     X: pd.DataFrame,
     pool_df: pd.DataFrame,
     global_imp_df: Optional[pd.DataFrame],
-    shap_df: Optional[pd.DataFrame],
+    shap_df: Optional[pd.DataFrame],  # non utilisé, gardé pour compat
 ) -> bytes:
-    """PDF dédié 'Nouveau client' + message de remerciement + axes d'amélioration."""
     if not REPORTLAB_AVAILABLE:
         return b""
     from reportlab.lib import colors
@@ -570,16 +518,15 @@ def build_new_client_report_pdf(
     story.append(t)
     story.append(Spacer(1, 8))
 
-    # Axes d'amélioration / Points forts
-    axes, strong = suggest_actions(shap_df, new_x, X, pool_df, top_n=5, global_imp_df=global_imp_df)
     story.append(Paragraph("Axes d’amélioration (si décision = Refus)", styles["H2"]))
+    axes, strong = suggest_actions(new_x, X, pool_df, top_n=5, global_imp_df=global_imp_df)
     if axes:
         data = [["Variable", "Valeur", "Recommandation"]]
         for a in axes:
             data.append([str(a["feature"]), "" if pd.isna(a["value"]) else str(a["value"]), a["note"]])
         t2 = Table(data, hAlign="LEFT", colWidths=[5.5*cm, 3.0*cm, 5.5*cm])
     else:
-        t2 = Table([["Information", "Détail"], ["Recommandations", "Aucune recommandation spécifique (explicabilité locale indisponible)."]],
+        t2 = Table([["Information", "Détail"], ["Recommandations", "Aucune recommandation disponible."]],
                    hAlign="LEFT", colWidths=[7*cm, 7*cm])
     t2.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
@@ -598,7 +545,7 @@ def build_new_client_report_pdf(
             data.append([str(s["feature"]), "" if pd.isna(s["value"]) else str(s["value"]), s["note"]])
         t3 = Table(data, hAlign="LEFT", colWidths=[5.5*cm, 3.0*cm, 5.5*cm])
     else:
-        t3 = Table([["Information", "Détail"], ["Points forts", "Non disponibles (explicabilité locale indisponible)."]],
+        t3 = Table([["Information", "Détail"], ["Points forts", "Non disponibles."]],
                    hAlign="LEFT", colWidths=[7*cm, 7*cm])
     t3.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
@@ -609,26 +556,6 @@ def build_new_client_report_pdf(
     ]))
     story.append(t3)
     story.append(Spacer(1, 8))
-
-    # Contributions locales si dispo
-    story.append(Paragraph("Contributions locales (top 10)", styles["H2"]))
-    if shap_df is not None and not shap_df.empty:
-        dfc = shap_df.sort_values("abs_val", ascending=False).head(10).copy()
-        dfc["effet"] = dfc["shap_value"].apply(lambda v: "↑ risque" if v > 0 else ("↓ risque" if v < 0 else "neutre"))
-        data = [["Variable", "Valeur", "Contribution", "Effet"]] + \
-               [[str(r["feature"]), str(r["value"]), f'{r["shap_value"]:+.4f}', r["effet"]] for _, r in dfc.iterrows()]
-        t4 = Table(data, hAlign="LEFT", colWidths=[6.0*cm, 3.5*cm, 3.0*cm, 2.0*cm])
-    else:
-        t4 = Table([["Information", "Détail"], ["Explicabilité", "Indisponible"]], hAlign="LEFT", colWidths=[10*cm, 4*cm])
-    t4.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
-        ("BOX", (0,0), (-1,-1), 0.25, colors.black),
-        ("INNERGRID", (0,0), (-1,-1), 0.25, colors.grey),
-        ("ALIGN", (2,1), (2,-1), "RIGHT"),
-        ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
-        ("FONTSIZE", (0,0), (-1,-1), 9),
-    ]))
-    story.append(t4)
 
     doc.build(story)
     pdf_bytes = buf.getvalue()
@@ -726,7 +653,7 @@ if not pool_df.empty and selected_id is not None:
             df_idx[c] = np.nan
     X = df_idx[expected_cols_local]
     x_row = X.loc[[selected_id]]
-    background = X.sample(min(200, len(X)), random_state=42)
+    background = X.sample(min(200, len(X)), random_state=42)  # conservé pour d'autres vues
 else:
     X = pd.DataFrame(columns=feature_names)
     x_row = X.head(0)
@@ -752,7 +679,6 @@ main_tabs = st.tabs(TABS)
 with main_tabs[0]:
     st.subheader("Score individuel & interprétation")
     proba = None
-    shap_df = None
     source_label = "Local"
 
     # PREDICT
@@ -761,20 +687,10 @@ with main_tabs[0]:
             st.error("API indisponible.")
         else:
             try:
-                payload = {"client_id": selected_id, "threshold": float(threshold), "shap": True, "topk": 10}
+                payload = {"client_id": selected_id, "threshold": float(threshold), "shap": False, "topk": 0}
                 resp = api_predict(api_base, payload)
                 proba = float(resp["proba_default"])
                 source_label = "API"
-                if resp.get("top_contrib"):
-                    rows = []
-                    for r in resp["top_contrib"]:
-                        rows.append({
-                            "feature": r["feature"],
-                            "shap_value": float(r["shap_value"]),
-                            "abs_val": abs(float(r["shap_value"])),
-                            "value": r["value"],
-                        })
-                    shap_df = pd.DataFrame(rows)
             except Exception as e:
                 st.warning(f"API KO ({e}). Bascule en Local si possible.")
                 if model_local is None:
@@ -810,44 +726,16 @@ with main_tabs[0]:
         st.caption(f"Source: **{source_label}**")
 
     with col2:
-        st.markdown("**Contributions locales (Top 10)**")
-        def _bar_from_df(df: pd.DataFrame, title: str) -> go.Figure:
-            tmp = df.copy()
-            tmp = tmp.sort_values("abs_val").tail(10)
-            x_vals = np.asarray(tmp["shap_value"].values, dtype=float)
+        st.markdown("**Importance globale (Top 10)**")
+        if global_imp_df is not None and not global_imp_df.empty:
+            tmp = global_imp_df.head(10).copy()
+            x_vals = np.asarray(tmp["importance"].values, dtype=float)
             y_vals = tmp["feature"].astype(str).tolist()
-            hover = [f"valeur: {v}" for v in tmp["value"]]
-            figb = go.Figure(go.Bar(x=x_vals, y=y_vals, orientation="h", hovertext=hover, hoverinfo="text+x+y"))
-            figb.update_layout(title=title)
-            return figb
-
-        if mode == "API FastAPI" and shap_df is not None and not shap_df.empty:
-            st.plotly_chart(_bar_from_df(shap_df, "Impact sur le score (positif = ↑ risque)"), use_container_width=True)
+            figb = go.Figure(go.Bar(x=x_vals, y=y_vals, orientation="h"))
+            figb.update_layout(title="Top 10 — Importance globale (SHAP local désactivé)")
+            st.plotly_chart(figb, use_container_width=True)
         else:
-            shap_enabled = st.toggle("Activer SHAP local (expérimental)", value=False)
-            if shap_enabled and not background.empty and model_local is not None:
-                try:
-                    vals, base_vals = compute_local_shap(model_local, background, x_row)
-                    shap_df_local = pd.DataFrame({
-                        "feature": list(X.columns),
-                        "shap_value": vals,
-                        "abs_val": np.abs(vals),
-                        "value": x_row.iloc[0].values,
-                    }).sort_values("abs_val", ascending=False)
-                    st.plotly_chart(_bar_from_df(shap_df_local, "Impact sur le score (positif = ↑ risque)"),
-                                    use_container_width=True)
-                except Exception as e:
-                    st.warning(f"SHAP local indisponible: {e}")
-            else:
-                if global_imp_df is not None and not global_imp_df.empty:
-                    tmp = global_imp_df.head(10).copy()
-                    x_vals = np.asarray(tmp["importance"].values, dtype=float)
-                    y_vals = tmp["feature"].astype(str).tolist()
-                    figb = go.Figure(go.Bar(x=x_vals, y=y_vals, orientation="h"))
-                    figb.update_layout(title="Top 10 — Importance globale")
-                    st.plotly_chart(figb, use_container_width=True)
-                else:
-                    st.info("Importance globale indisponible.")
+            st.info("Importance globale indisponible.")
 
     st.divider()
     st.subheader("📄 Export")
@@ -865,7 +753,7 @@ with main_tabs[0]:
                 X=X,
                 pool_df=pool_df,
                 global_imp_df=global_imp_df,
-                shap_vals=(shap_df if shap_df is not None and not shap_df.empty else None),
+                shap_vals=None,
             )
             filename = f"fiche_client_{client_id_str}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
             st.download_button("📄 Exporter la fiche client (PDF)", data=pdf_bytes, file_name=filename, mime="application/pdf",
@@ -1018,6 +906,11 @@ with main_tabs[5]:
         except Exception as e:
             st.error(f"Impossible de lire le CSV : {e}")
 
+    # Option EXPRESS : pré-remplir avec le client sélectionné
+    if st.button("➡️ Pré-remplir avec le client sélectionné"):
+        if not x_row.empty:
+            new_x = x_row.copy().reset_index(drop=True)
+
     if manual and new_x is None:
         if global_imp_df is not None and not global_imp_df.empty:
             keys = [f for f in global_imp_df["feature"].tolist() if f in X.columns][:topk]
@@ -1045,56 +938,39 @@ with main_tabs[5]:
             new_x = pd.DataFrame([inputs])
 
     if new_x is not None:
+        # réaligner
         exp_cols = list(X.columns)
         for c in exp_cols:
             if c not in new_x.columns:
                 new_x[c] = np.nan
         new_x = new_x[exp_cols]
 
+        # prédiction
         if mode == "API FastAPI":
             if not api_base or not api_ok:
                 st.error("API indisponible pour scorer le nouveau client.")
+                new_p = None
             else:
                 try:
                     payload = {
                         "features": {k: (None if pd.isna(v) else v) for k, v in new_x.iloc[0].to_dict().items()},
-                        "threshold": float(threshold), "shap": True, "topk": 10
+                        "threshold": float(threshold), "shap": False, "topk": 0
                     }
                     resp = api_predict(api_base, payload)
                     new_p = float(resp["proba_default"])
-                    shap_rows = resp.get("top_contrib") or []
-                    if shap_rows:
-                        shap_df2 = pd.DataFrame([{
-                            "feature": r["feature"],
-                            "shap_value": float(r["shap_value"]),
-                            "abs_val": abs(float(r["shap_value"])),
-                            "value": r["value"],
-                        } for r in shap_rows])
-                    else:
-                        shap_df2 = None
                 except Exception as e:
                     st.error(f"API KO: {e}")
-                    new_p, shap_df2 = None, None
+                    new_p = None
         else:
             if model_local is None:
                 st.error("Modèle local indisponible.")
-                new_p, shap_df2 = None, None
+                new_p = None
             else:
                 try:
                     new_p = float(model_local.predict_proba(new_x)[0, 1])
-                    try:
-                        vals, _ = compute_local_shap(model_local, background, new_x)
-                        shap_df2 = pd.DataFrame({
-                            "feature": list(X.columns),
-                            "shap_value": vals,
-                            "abs_val": np.abs(vals),
-                            "value": new_x.iloc[0].values,
-                        }).sort_values("abs_val", ascending=False).head(10)
-                    except Exception:
-                        shap_df2 = None
                 except Exception as e:
                     st.error(f"Échec de la prédiction: {e}")
-                    new_p, shap_df2 = None, None
+                    new_p = None
 
         if new_p is not None:
             band2, color2 = prob_to_band(float(new_p), low=0.05, high=0.15)
@@ -1119,32 +995,23 @@ with main_tabs[5]:
             st.markdown(f"**Décision (seuil {float(threshold):.3f})** : **{decision}**")
             st.markdown(f"Niveau de risque : **{band2}**")
 
-            used_fallback = (shap_df2 is None) or shap_df2.empty
-            axes, strong = suggest_actions(shap_df2, new_x, X, pool_df, top_n=5, global_imp_df=global_imp_df)
+            axes, strong = suggest_actions(new_x, X, pool_df, top_n=5, global_imp_df=global_imp_df)
 
-            if used_fallback:
-                st.info("Explicabilité locale indisponible ; recommandations basées sur l’importance globale.")
+            with st.expander("🛠️ Axes d’amélioration (si décision = Refus)", expanded=True):
+                st.dataframe(pd.DataFrame([{
+                    "Variable": a["feature"],
+                    "Valeur": ("" if pd.isna(a["value"]) else a["value"]),
+                    "Recommandation": a["note"],
+                } for a in axes]) if axes else pd.DataFrame([{"Variable":"—","Valeur":"—","Recommandation":"Aucune recommandation disponible."}]),
+                use_container_width=True)
 
-            with st.expander("🛠️ Axes d’amélioration (si décision = Refus)"):
-                if axes:
-                    st.dataframe(pd.DataFrame([{
-                        "Variable": a["feature"],
-                        "Valeur": ("" if pd.isna(a["value"]) else a["value"]),
-                        "Recommandation": a["note"],
-                    } for a in axes]), use_container_width=True)
-                else:
-                    st.info("Aucune recommandation spécifique (explicabilité locale indisponible).")
-                    st.caption(f"DEBUG — axes={len(axes)}, strong={len(strong)}")
-
-            with st.expander("🌟 Points forts"):
-                if strong:
-                    st.dataframe(pd.DataFrame([{
-                        "Variable": s["feature"],
-                        "Valeur": ("" if pd.isna(s["value"]) else s["value"]),
-                        "Commentaire": s["note"],
-                    } for s in strong]), use_container_width=True)
-                else:
-                    st.info("Non disponible (explicabilité locale indisponible).")
+            with st.expander("🌟 Points forts", expanded=False):
+                st.dataframe(pd.DataFrame([{
+                    "Variable": s["feature"],
+                    "Valeur": ("" if pd.isna(s["value"]) else s["value"]),
+                    "Commentaire": s["note"],
+                } for s in strong]) if strong else pd.DataFrame([{"Variable":"—","Valeur":"—","Commentaire":"Non disponible."}]),
+                use_container_width=True)
 
             st.divider()
             st.subheader("📄 Export (nouveau client)")
@@ -1161,7 +1028,7 @@ with main_tabs[5]:
                         X=X,
                         pool_df=pool_df,
                         global_imp_df=global_imp_df,
-                        shap_df=shap_df2
+                        shap_df=None
                     )
                     fname = f"nouveau_client_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
                     st.download_button("📄 Télécharger le PDF (nouveau client)",
@@ -1169,15 +1036,6 @@ with main_tabs[5]:
                                        use_container_width=True)
                 except Exception as e:
                     st.error(f"Échec génération PDF nouveau client : {e}")
-
-            # SHAP
-            if shap_df2 is not None and not shap_df2.empty:
-                tmp = shap_df2.copy().sort_values("abs_val").tail(10)
-                x_vals = np.asarray(tmp["shap_value"].values, dtype=float)
-                y_vals = tmp["feature"].astype(str).tolist()
-                figb2 = go.Figure(go.Bar(x=x_vals, y=y_vals, orientation="h"))
-                figb2.update_layout(title="Contributions locales (SHAP) — top 10")
-                st.plotly_chart(figb2, use_container_width=True)
 
 # -------------------------------
 # Tab 7 — Seuil & coût métier
@@ -1364,4 +1222,4 @@ with footer_cols[0]:
 with footer_cols[1]:
     st.caption("App version: " + APP_VERSION)
 with footer_cols[2]:
-    st.caption("Build: Streamlit + SHAP + scikit-learn")
+    st.caption("Build: Streamlit + scikit-learn")
