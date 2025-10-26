@@ -1,9 +1,9 @@
-# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v1.4.0)
+# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v1.5.0)
 # ----------------------------------------------------------------
 # Run:
 #   python -m streamlit run dashboard_streamlit_app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 
 import os
 import json
@@ -151,18 +151,24 @@ def get_expected_input_columns(model) -> Optional[List[str]]:
         pass
     return None
 
-# ---------- SHAP local (robuste avec fallback permutation) ----------
+# ---------- SHAP local (robuste) ----------
 def compute_local_shap(estimator, X_background: pd.DataFrame, x_row: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    1) Tentative standard (masker Independent) sur TOUTES colonnes
+    2) Fallback robuste : SHAP Permutation **uniquement sur les colonnes numériques**,
+       en gardant les features non-numériques fixes (valeurs du client).
+       Retourne un vecteur de contributions aligné sur X_background.columns
+       (0 pour les colonnes non-numériques si fallback).
+    """
     import shap
-    # Échantillon de fond limité
+
     bg = X_background.copy()
     if len(bg) > 200:
         bg = bg.sample(200, random_state=42)
 
-    # Fonction modèle : garantit l'ordre & les noms de colonnes attendues
     expected_cols = list(bg.columns)
 
-    def f(Xdf):
+    def f_full(Xdf):
         import pandas as pd
         if not isinstance(Xdf, pd.DataFrame):
             Xdf = pd.DataFrame(Xdf, columns=expected_cols)
@@ -170,22 +176,54 @@ def compute_local_shap(estimator, X_background: pd.DataFrame, x_row: pd.DataFram
             Xdf = Xdf.reindex(columns=expected_cols)
         return estimator.predict_proba(Xdf)[:, 1]
 
-    # 1) Tentative standard (masker Independent)
+    # 1) essai standard
     try:
         masker = shap.maskers.Independent(bg)
-        explainer = shap.Explainer(f, masker, feature_names=expected_cols)
-        ex = explainer(x_row.reindex(columns=expected_cols))
-        return np.array(ex.values).reshape(-1), np.array(ex.base_values).reshape(-1)
+        ex = shap.Explainer(f_full, masker, feature_names=expected_cols)(x_row.reindex(columns=expected_cols))
+        vals = np.array(ex.values).reshape(-1)
+        base = np.array(ex.base_values).reshape(-1)
+        return vals, base
     except Exception:
         pass
 
-    # 2) Fallback robuste : Permutation explainer (peu sensible aux dtypes)
+    # 2) fallback numérique-only (catégorielles fixées)
+    num_cols = [c for c in expected_cols if pd.api.types.is_numeric_dtype(bg[c])]
+    if not num_cols:
+        raise RuntimeError("Aucune colonne numérique disponible pour SHAP fallback.")
+
+    # Prépare fond et instance numériques (remplissage NaN pour stabilité)
+    bg_num = pd.DataFrame({c: pd.to_numeric(bg[c], errors="coerce") for c in num_cols})
+    medians = bg_num.median(numeric_only=True)
+    bg_num = bg_num.fillna(medians)
+
+    x_fixed = x_row.reindex(columns=expected_cols).iloc[0].copy()
+    x_num = pd.DataFrame({c: pd.to_numeric([x_fixed[c]], errors="coerce") for c in num_cols}).fillna(medians).iloc[[0]]
+
+    def f_num(Xnum):
+        import pandas as pd
+        # Xnum → DataFrame numeric avec les bonnes colonnes
+        if not isinstance(Xnum, pd.DataFrame):
+            Xnum = pd.DataFrame(Xnum, columns=num_cols)
+        else:
+            Xnum = Xnum.reindex(columns=num_cols)
+        # reconstruit le DF complet en gardant non-numériques fixes
+        full = pd.DataFrame([x_fixed] * len(Xnum), columns=expected_cols)
+        for c in num_cols:
+            full[c] = Xnum[c].values
+        return estimator.predict_proba(full)[:, 1]
+
     try:
-        explainer_perm = shap.explainers.Permutation(f, bg)
-        ex = explainer_perm(x_row.reindex(columns=expected_cols))
-        return np.array(ex.values).reshape(-1), np.array(ex.base_values).reshape(-1)
+        ex = shap.explainers.Permutation(f_num, bg_num)(x_num)
+        vals_num = np.array(ex.values).reshape(-1)    # taille = len(num_cols)
+        base = np.array(ex.base_values).reshape(-1)
+        # Remplit un vecteur aligné sur expected_cols (0 pour non-numériques)
+        vals_full = np.zeros(len(expected_cols), dtype=float)
+        col_pos = {c: i for i, c in enumerate(expected_cols)}
+        for i, c in enumerate(num_cols):
+            vals_full[col_pos[c]] = vals_num[i]
+        return vals_full, base
     except Exception as e2:
-        raise RuntimeError(f"SHAP indisponible (y compris permutation): {e2}")
+        raise RuntimeError(f"SHAP indisponible même en fallback numérique: {e2}")
 
 # ---------- Utils quantiles / cohortes ----------
 def get_quantile_series(feature: str, pool_df: pd.DataFrame, X: pd.DataFrame) -> Optional[pd.Series]:
@@ -697,7 +735,8 @@ with main_tabs[0]:
                     }).sort_values("abs_val", ascending=False)
                     st.plotly_chart(_bar_from_df(shap_df_local, "Impact sur le score (positif = ↑ risque)"),
                                     use_container_width=True)
-                except Exception as e:
+                except Exception:
+                    # On n’affiche plus l’erreur ; on bascule proprement
                     if global_imp_df is not None and not global_imp_df.empty:
                         st.info("Explicabilité locale indisponible. Affichage de l'importance globale.")
                         tmp = global_imp_df.head(10).copy()
@@ -784,7 +823,6 @@ with main_tabs[2]:
 
         st.caption(f"Taille de la cohorte similaire : **{fmt_int(len(cohort_df))}**")
 
-        # Choix de 8 variables numériques montrables
         if global_imp_df is not None and not global_imp_df.empty:
             cand = [f for f in global_imp_df["feature"].tolist() if f in pool_df.columns]
         else:
@@ -842,11 +880,42 @@ with main_tabs[2]:
 # -------------------------------
 with main_tabs[3]:
     st.subheader("Qualité des données & valeurs manquantes")
+
     miss_fig = _pick_first_existing(["__results___5_1.png", "missing_train.png"])
     if miss_fig:
         st.image(miss_fig, caption="Top taux de valeurs manquantes (train)")
     else:
         st.info("Figure de valeurs manquantes non trouvée.")
+
+    st.markdown("### Distribution du **nombre de champs manquants par dossier**")
+    if not pool_df.empty:
+        # Utilise la colonne fournie si dispo, sinon calcule à la volée
+        if "MISSING_COUNT_ROW" in pool_df.columns:
+            s_missing = pd.to_numeric(pool_df["MISSING_COUNT_ROW"], errors="coerce")
+        else:
+            cols_for_missing = [c for c in X.columns if c != TARGET_COL]
+            s_missing = pool_df[cols_for_missing].isna().sum(axis=1)
+
+        s_missing = s_missing.fillna(0)
+        figm = go.Figure()
+        figm.add_trace(go.Histogram(x=s_missing.values, nbinsx=50, name="Dossiers"))
+        try:
+            cli_val = float(
+                (pool_df.loc[pool_df[ID_COL] == selected_id, "MISSING_COUNT_ROW"].iloc[0])
+                if "MISSING_COUNT_ROW" in pool_df.columns
+                else (pool_df.loc[pool_df[ID_COL] == selected_id, X.columns].isna().sum(axis=1).iloc[0])
+            )
+            figm.add_vline(x=cli_val, line_color="red", line_dash="dash",
+                           annotation_text=f"Client: {fmt_int(cli_val)}", annotation_position="top right")
+        except Exception:
+            pass
+        figm.update_layout(xaxis_title="Champs manquants (par dossier)", yaxis_title="Fréquence", height=350, separators=", ")
+        st.plotly_chart(figm, use_container_width=True)
+
+        q10, q50, q90 = np.percentile(s_missing.values, [10,50,90])
+        st.caption(f"P10={fmt_int(q10)} • Médiane={fmt_int(q50)} • P90={fmt_int(q90)}")
+    else:
+        st.info("Données indisponibles pour cette analyse.")
 
 # -------------------------------
 # Tab 5 — Nouveau client
@@ -903,7 +972,6 @@ with main_tabs[4]:
                 new_x[c] = np.nan
         new_x = new_x[exp_cols]
 
-        # On mémorise la dernière ligne "nouveau client" pour la page Ratios
         st.session_state["last_new_client_row"] = new_x.copy()
 
         if mode == "API FastAPI":
@@ -1042,9 +1110,8 @@ with main_tabs[4]:
                     st.error(f"Échec génération PDF nouveau client : {e}")
 
 # -------------------------------
-# Tab 6 — Dictionnaire des variables (traduction TOUTES colonnes)
+# Tab 6 — Dictionnaire des variables
 # -------------------------------
-# Dicos spécifiques (prioritaires)
 FEATURE_LABELS_SPEC = {
     "SK_ID_CURR": "Identifiant client",
     "CODE_GENDER": "Sexe",
@@ -1085,27 +1152,15 @@ FEATURE_LABELS_SPEC = {
     "REGION_RATING_CLIENT": "Indice région (rating)",
     "AGE_BIN": "Tranche d'âge",
 }
-
-# Heuristiques génériques (appliquées si non dans SPEC)
 def french_label(col: str) -> str:
     if col in FEATURE_LABELS_SPEC:
         return FEATURE_LABELS_SPEC[col]
     c = col.upper()
-
-    # Patterns courants
     repl = [
-        ("AMT_", "Montant "),
-        ("CNT_", "Nombre "),
-        ("DAYS_", "Jours "),
-        ("YEARS", "Années"),
-        ("HOUR", "Heure"),
-        ("MIN", "Minute"),
-        ("SEC", "Seconde"),
-        ("FLAG_", "Indicateur "),
-        ("NAME_", "Libellé "),
-        ("EXT_SOURCE_", "Score externe "),
-        ("EXT_SOURCES_", "Scores externes "),
-        ("REGION_", "Région "),
+        ("AMT_", "Montant "), ("CNT_", "Nombre "), ("DAYS_", "Jours "),
+        ("YEARS", "Années"), ("HOUR", "Heure"), ("MIN", "Minute"), ("SEC", "Seconde"),
+        ("FLAG_", "Indicateur "), ("NAME_", "Libellé "), ("EXT_SOURCE_", "Score externe "),
+        ("EXT_SOURCES_", "Scores externes "), ("REGION_", "Région "),
         ("ORGANIZATION_TYPE", "Secteur employeur"),
         ("WEEKDAY_APPR_PROCESS_START", "Jour de la demande"),
         ("SK_ID", "Identifiant "),
@@ -1113,22 +1168,15 @@ def french_label(col: str) -> str:
     label = c
     for a, b in repl:
         label = label.replace(a, b)
-    # Nettoyage
     label = label.replace("__", " ").replace("_", " ").strip()
-    # Titrage
     label = label.capitalize()
-    # Ajustements sémantiques
-    label = label.replace("Amt ", "Montant ")
-    label = label.replace("Cnt ", "Nombre ")
+    label = label.replace("Amt ", "Montant ").replace("Cnt ", "Nombre ")
     label = label.replace("Indicateur own car", "Possède une voiture")
     label = label.replace("Indicateur own realty", "Possède un bien immobilier")
     label = label.replace("Libellé education type", "Niveau d'éducation")
     label = label.replace("Libellé income type", "Type de revenu")
     label = label.replace("Libellé family status", "Situation familiale")
     label = label.replace("Libellé housing type", "Type de logement")
-    label = label.replace("Score externe 1", "Score externe 1")
-    label = label.replace("Score externe 2", "Score externe 2")
-    label = label.replace("Score externe 3", "Score externe 3")
     return label
 
 with main_tabs[5]:
@@ -1138,11 +1186,7 @@ with main_tabs[5]:
     else:
         rows = []
         for c in pool_df.columns:
-            rows.append({
-                "Variable": c,
-                "Nom (FR)": french_label(c),
-                "Description": "—"  # à enrichir si besoin
-            })
+            rows.append({"Variable": c, "Nom (FR)": french_label(c), "Description": "—"})
         dict_df = pd.DataFrame(rows)
         st.dataframe(dict_df.sort_values("Variable"), use_container_width=True)
 
@@ -1151,8 +1195,7 @@ with main_tabs[5]:
 # -------------------------------
 def _safe_div(a, b):
     try:
-        a = float(a)
-        b = float(b)
+        a = float(a); b = float(b)
         if b == 0 or pd.isna(a) or pd.isna(b):
             return np.nan
         return a / b
@@ -1166,7 +1209,6 @@ def _to_years(days):
         return np.nan
 
 def compute_ratios_for_row(row: pd.Series) -> pd.DataFrame:
-    # On tolère valeurs manquantes; on renvoie un tableau clair
     vals = {}
     g = lambda k: row.get(k, np.nan)
 
@@ -1175,14 +1217,12 @@ def compute_ratios_for_row(row: pd.Series) -> pd.DataFrame:
     vals["ANNUITY_INCOME_RATIO"]= _safe_div(g("AMT_ANNUITY"), g("AMT_INCOME_TOTAL"))
     vals["CREDIT_GOODS_RATIO"]  = _safe_div(g("AMT_CREDIT"), g("AMT_GOODS_PRICE"))
 
-    # Scores externes
     s1, s2, s3 = g("EXT_SOURCE_1"), g("EXT_SOURCE_2"), g("EXT_SOURCE_3")
     ext_list = [x for x in [s1, s2, s3] if pd.notna(x)]
     vals["EXT_SOURCES_MEAN"] = (np.mean(ext_list) if ext_list else np.nan)
     vals["EXT_SOURCES_SUM"]  = (np.sum(ext_list)  if ext_list else np.nan)
     vals["EXT_SOURCES_NA"]   = 3 - len(ext_list)
 
-    # Âge et ancienneté
     age_years   = g("AGE_YEARS")
     if pd.isna(age_years) and "DAYS_BIRTH" in row.index:
         age_years = _to_years(g("DAYS_BIRTH"))
@@ -1193,15 +1233,12 @@ def compute_ratios_for_row(row: pd.Series) -> pd.DataFrame:
     vals["EMPLOY_YEARS"]= employ_years
     vals["EMPLOY_TO_AGE_RATIO"] = _safe_div(employ_years, age_years)
 
-    # Revenu par personne & ratio enfants
     vals["INCOME_PER_PERSON"] = _safe_div(g("AMT_INCOME_TOTAL"), g("CNT_FAM_MEMBERS"))
     vals["CHILDREN_RATIO"]    = _safe_div(g("CNT_CHILDREN"), g("CNT_FAM_MEMBERS"))
 
-    # DOC & MISSING s'ils existent
     vals["DOC_COUNT"]         = g("DOC_COUNT") if "DOC_COUNT" in row.index else np.nan
     vals["MISSING_COUNT_ROW"] = g("MISSING_COUNT_ROW") if "MISSING_COUNT_ROW" in row.index else np.nan
 
-    # Mise en forme
     out = []
     for k, v in vals.items():
         out.append({
@@ -1225,23 +1262,17 @@ def compute_ratios_for_row(row: pd.Series) -> pd.DataFrame:
             }.get(k, "—")
         })
     df = pd.DataFrame(out)
-    # Formatage lisible (valeurs petites en décimales, grosses avec espace)
     def _fmt(v):
-        if pd.isna(v):
-            return "—"
-        try:
-            fv = float(v)
-        except Exception:
-            return str(v)
-        if abs(fv) >= 1000:
-            return fmt_num(fv, 0)
+        if pd.isna(v): return "—"
+        try: fv = float(v)
+        except Exception: return str(v)
+        if abs(fv) >= 1000: return fmt_num(fv, 0)
         return fmt_num(fv, 4)
     df["Valeur"] = df["Valeur"].map(_fmt)
     return df
 
 with main_tabs[6]:
     st.subheader("Ratios & variables dérivées (calculs réels)")
-
     colA, colB = st.columns(2)
     with colA:
         st.markdown("**Client sélectionné**")
@@ -1263,7 +1294,7 @@ with main_tabs[6]:
                 st.warning(f"Impossible d'afficher les ratios du nouveau client : {e}")
 
 # -------------------------------
-# Tab 8 — Seuil & coût métier (inchangé)
+# Tab 8 — Seuil & coût métier
 # -------------------------------
 with main_tabs[7]:
     st.subheader("Seuil & coût métier (optimisation)")
