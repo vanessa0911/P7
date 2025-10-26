@@ -1032,6 +1032,52 @@ with main_tabs[5]:
             # ➕ Ajouts : décision & rappel du seuil
             st.markdown(f"**Décision (seuil {float(threshold):.3f})** : **{decision}**")
             st.markdown(f"Niveau de risque : **{band2}**")
+            # ==== Recommandations & export PDF (nouveau client) ====
+            axes, strong = suggest_actions(shap_df2, new_x, X, pool_df, top_n=5)
+
+            with st.expander("🛠️ Axes d’amélioration (si décision = Refus)"):
+                if axes:
+                    st.dataframe(pd.DataFrame([{
+                        "Variable": a["feature"],
+                        "Valeur": ("" if pd.isna(a["value"]) else a["value"]),
+                        "Recommandation": a["note"],
+                    } for a in axes]), use_container_width=True)
+                else:
+                    st.info("Aucune recommandation spécifique (explicabilité locale indisponible).")
+
+            with st.expander("🌟 Points forts"):
+                if strong:
+                    st.dataframe(pd.DataFrame([{
+                        "Variable": s["feature"],
+                        "Valeur": ("" if pd.isna(s["value"]) else s["value"]),
+                        "Commentaire": s["note"],
+                    } for s in strong]), use_container_width=True)
+                else:
+                    st.info("Non disponible (explicabilité locale indisponible).")
+
+            st.divider()
+            st.subheader("📄 Export (nouveau client)")
+            if not REPORTLAB_AVAILABLE:
+                st.warning("Le module **reportlab** n'est pas installé. `pip install reportlab` puis relancez l'app.")
+            else:
+                try:
+                    pdf_new = build_new_client_report_pdf(
+                        proba=float(new_p),
+                        threshold=float(threshold),
+                        decision=decision,
+                        band_label=band2,
+                        new_x=new_x,
+                        X=X,
+                        pool_df=pool_df,
+                        global_imp_df=global_imp_df,
+                        shap_df=shap_df2
+                    )
+                    fname = f"nouveau_client_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+                    st.download_button("📄 Télécharger le PDF (nouveau client)",
+                                       data=pdf_new, file_name=fname, mime="application/pdf",
+                                       use_container_width=True)
+                except Exception as e:
+                    st.error(f"Échec génération PDF nouveau client : {e}")
 
             # SHAP (inchangé)
             if shap_df2 is not None and not shap_df2.empty:
