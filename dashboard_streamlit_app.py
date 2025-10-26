@@ -1,9 +1,9 @@
-# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v0.9.0)
+# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v0.9.1)
 # ----------------------------------------------------------------
 # Run:
 #   python -m streamlit run dashboard_streamlit_app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true
 
-APP_VERSION = "0.9.0"
+APP_VERSION = "0.9.1"
 
 import os
 import json
@@ -336,10 +336,10 @@ def suggest_actions(
     global_imp_df: Optional[pd.DataFrame] = None,
 ) -> tuple[list[dict], list[dict]]:
     """
-    Retourne (axes_amelioration, points_forts).
-    - Cas 1: SHAP dispo -> s'appuie sur shap_df (positif = ↑ risque, négatif = ↓ risque)
+    Retourne (axes_amelioration, points_forts), DÉDOUBLONNÉS par variable.
+    - Cas 1: SHAP dispo -> s'appuie sur shap_df (positif = ↑ risque, négatif = ↓ risque).
     - Cas 2: SHAP indispo -> fallback basé sur importance globale + position vs médiane,
-             avec un filet de sécurité pour toujours proposer quelques axes.
+             avec filet de sécurité.
     Chaque item = {"feature": str, "value": any, "note": str}
     """
     def _quantiles_for(f: str):
@@ -352,6 +352,17 @@ def suggest_actions(
             return None
         q = s.quantile([0.1, 0.5, 0.9])
         return {"p10": float(q.loc[0.1]), "p50": float(q.loc[0.5]), "p90": float(q.loc[0.9])}
+
+    def _unique_by_feature(items: list[dict]) -> list[dict]:
+        seen = set()
+        out = []
+        for it in items:
+            f = str(it.get("feature"))
+            if f in seen:
+                continue
+            seen.add(f)
+            out.append(it)
+        return out
 
     RULES = {
         "CREDIT_GOODS_RATIO": "Un ratio crédit/biens plus faible (apport initial plus élevé) réduit le risque.",
@@ -402,6 +413,9 @@ def suggest_actions(
             f = str(r["feature"]); v = row[f] if f in row.index else np.nan; q = _quantiles_for(f)
             strong.append({"feature": f, "value": v, "note": _mk_note(f, v, False, q)})
 
+        # Dédup + coupe au top_n
+        axes = _unique_by_feature(axes)[:top_n]
+        strong = [s for s in _unique_by_feature(strong) if s["feature"] not in {a["feature"] for a in axes}][:top_n]
         return axes, strong
 
     # ===== Cas 2: Fallback sans SHAP =====
@@ -431,9 +445,9 @@ def suggest_actions(
         spread = max(q["p90"] - q["p10"], 1e-9)
         deviation = abs(v_float - q["p50"]) / spread
         if f in HIGH_IS_RISK:
-            shap_pos_guess = (v_float > q["p50"])
+            shap_pos_guess = (v_float > q["p50"])   # ↑ risque si au-dessus médiane
         elif f in LOW_IS_RISK:
-            shap_pos_guess = (v_float < q["p50"])
+            shap_pos_guess = (v_float < q["p50"])   # ↑ risque si en-dessous médiane
         else:
             shap_pos_guess = (v_float > q["p90"] or v_float < q["p10"])
         scored.append((f, v, q, deviation, shap_pos_guess))
@@ -446,6 +460,7 @@ def suggest_actions(
         else:
             strong.append({"feature": f, "value": v, "note": _mk_note(f, v, False, q)})
 
+    # Filet de sécurité si aucun axe
     if not axes:
         forced = []
         for f, v, q, _, _ in scored:
@@ -461,6 +476,10 @@ def suggest_actions(
             for f, v, q, _, _ in scored[:min(3, top_n)]:
                 forced.append({"feature": f, "value": v, "note": _mk_note(f, v, True, q)})
         axes = forced
+
+    # Dédup stricte : retirer des points forts toute variable déjà en axes
+    axes = _unique_by_feature(axes)[:top_n]
+    strong = [s for s in _unique_by_feature(strong) if s["feature"] not in {a["feature"] for a in axes}][:top_n]
 
     return axes, strong
 
@@ -525,15 +544,20 @@ def build_new_client_report_pdf(
     story.append(t)
     story.append(Spacer(1, 8))
 
+    # Axes / Points forts dédupliqués
     axes, strong = suggest_actions(shap_df, new_x, X, pool_df, top_n=5, global_imp_df=global_imp_df)
+
     story.append(Paragraph("Axes d’amélioration (si décision = Refus)", styles["H2"]))
-    if axes:
+    if decision == "Refus" and axes:
         data = [["Variable", "Valeur", "Recommandation"]]
         for a in axes:
             data.append([str(a["feature"]), "" if pd.isna(a["value"]) else str(a["value"]), a["note"]])
         t2 = Table(data, hAlign="LEFT", colWidths=[5.5*cm, 3.0*cm, 5.5*cm])
-    else:
+    elif decision == "Refus" and not axes:
         t2 = Table([["Information", "Détail"], ["Recommandations", "Aucune recommandation spécifique (explicabilité locale indisponible)."]],
+                   hAlign="LEFT", colWidths=[7*cm, 7*cm])
+    else:
+        t2 = Table([["Information", "Détail"], ["Décision", "Accord — pas d’axes d’amélioration nécessaires."]],
                    hAlign="LEFT", colWidths=[7*cm, 7*cm])
     t2.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
@@ -1079,17 +1103,22 @@ with main_tabs[5]:
             if used_fallback:
                 st.info("Explicabilité locale indisponible ; recommandations basées sur l’importance globale.")
 
-            with st.expander("🛠️ Axes d’amélioration (si décision = Refus)"):
-                if axes:
-                    st.dataframe(pd.DataFrame([{
-                        "Variable": a["feature"],
-                        "Valeur": ("" if pd.isna(a["value"]) else a["value"]),
-                        "Recommandation": a["note"],
-                    } for a in axes]), use_container_width=True)
-                else:
-                    st.info("Aucune recommandation spécifique (explicabilité locale indisponible).")
+            # Afficher AXES uniquement si Refus ; sinon message explicite
+            if decision == "Refus":
+                with st.expander("🛠️ Axes d’amélioration (si décision = Refus)", expanded=True):
+                    if axes:
+                        st.dataframe(pd.DataFrame([{
+                            "Variable": a["feature"],
+                            "Valeur": ("" if pd.isna(a["value"]) else a["value"]),
+                            "Recommandation": a["note"],
+                        } for a in axes]), use_container_width=True)
+                    else:
+                        st.info("Aucune recommandation spécifique (explicabilité locale indisponible).")
+            else:
+                with st.expander("🛠️ Axes d’amélioration"):
+                    st.info("Décision = **Accord** : pas d’axes d’amélioration nécessaires.")
 
-            with st.expander("🌟 Points forts"):
+            with st.expander("🌟 Points forts", expanded=True):
                 if strong:
                     st.dataframe(pd.DataFrame([{
                         "Variable": s["feature"],
@@ -1097,7 +1126,7 @@ with main_tabs[5]:
                         "Commentaire": s["note"],
                     } for s in strong]), use_container_width=True)
                 else:
-                    st.info("Non disponible (explicabilité locale indisponible).")
+                    st.info("Points forts non disponibles (explicabilité locale indisponible).")
 
             st.divider()
             st.subheader("📄 Export (nouveau client)")
@@ -1293,8 +1322,7 @@ with main_tabs[6]:
                     cur_row = {
                         "Seuil": f"{st.session_state['threshold']:.3f}",
                         "Coût total": f"{cur['cost']:.0f} {unit}",
-                        "TP": int(cur["tp"]), "FP": int(cur["fp"]), "FN": int[cur["fn"]] if False else int(cur["fn"]),
-                        "TN": int(cur["tn"]),
+                        "TP": int(cur["tp"]), "FP": int(cur["fp"]), "FN": int(cur["fn"]), "TN": int(cur["tn"]),
                         "Précision": f"{cur['precision']:.3f}", "Rappel": f"{cur['recall']:.3f}", "F1": f"{cur['f1']:.3f}",
                     }
                     st.markdown("**Synthèse**")
