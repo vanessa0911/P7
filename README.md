@@ -16,6 +16,10 @@ API base URL
 (https://p7youpi.onrender.com)
 
 -----------
+render : 
+Build Command : pip install --upgrade pip setuptools wheel && pip install --no-cache-dir -r requirements-api.txt
+Start Command : uvicorn main:app --host 0.0.0.0 --port $PORT
+-------------
 
 Comment tester vite que tout est OK
 
