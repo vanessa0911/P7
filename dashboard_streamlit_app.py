@@ -136,54 +136,73 @@ def get_expected_input_columns(model) -> Optional[List[str]]:
         pass
     return None
 
-# ====== SHAP local robuste (numérique uniquement, cat. fixées) ======
+# ====== SHAP local robuste (KernelExplainer numérique uniquement) ======
+def _to_float_df(df: pd.DataFrame, fill: Optional[pd.Series] = None) -> pd.DataFrame:
+    out = df.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    if fill is None:
+        fill = out.median(numeric_only=True)
+    return out.fillna(fill).astype(np.float64)
+
 def compute_local_shap(estimator, X_background: pd.DataFrame, x_row: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, List[str], np.ndarray]:
     """
-    Explique localement en se restreignant aux colonnes numériques, en gardant toutes
-    les colonnes non-numériques fixées aux valeurs de x_row. Évite l'erreur isfinite().
-    Retourne: (shap_values, base_values, feature_names_used, feature_values_used)
+    Calcule des contributions SHAP locales stables :
+      - ne garde que les colonnes numériques (float64)
+      - remplace NaN/Inf par la médiane (sur le background)
+      - f fixe toutes les colonnes non-numériques à la valeur du client
+      - utilise shap.KernelExplainer pour éviter les soucis de dtype
+    Retourne: (shap_values, base_value, features_utilisées, valeurs_features)
     """
     import shap
 
-    # 1) Colonnes numériques uniquement pour l'explication
+    # 1) colonnes numériques uniquement
     num_cols = [c for c in X_background.columns if pd.api.types.is_numeric_dtype(X_background[c])]
     if len(num_cols) == 0:
         raise ValueError("Aucune colonne numérique disponible pour SHAP local.")
 
-    # 2) Construire bg_num et x_row_num propres (float64, sans NaN/Inf)
-    bg_num = X_background[num_cols].copy()
-    bg_num = bg_num.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
-    bg_num = bg_num.fillna(bg_num.median(numeric_only=True))
-    x_row_num = x_row[num_cols].copy()
-    x_row_num = x_row_num.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
-    x_row_num = x_row_num.fillna(bg_num.median(numeric_only=True))
+    bg_num_raw = X_background[num_cols].copy()
+    x_num_raw = x_row[num_cols].copy()
 
-    # 3) Valeur de référence complète (toutes colonnes) maintenue fixe pour les non-numériques
+    # 2) nettoyer → float64, finite
+    med = bg_num_raw.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan).median(numeric_only=True)
+    bg_num = _to_float_df(bg_num_raw, fill=med)
+    x_num = _to_float_df(x_num_raw, fill=med)
+
+    # numpy (float64)
+    bg_np = bg_num.to_numpy(dtype=np.float64)
+    x_np = x_num.to_numpy(dtype=np.float64)
+
+    # 3) prédicteur: reconstruit X complet avec cat. fixées à la ligne client
     fixed_row_full = x_row.iloc[0].copy()
     expected_cols = list(X_background.columns)
-    num_medians = bg_num.median(numeric_only=True)
+    num_meds = pd.Series(med, index=num_cols)
 
-    def f_num(Xnum):
-        # Xnum (n, len(num_cols)) → reconstruire un DF complet pour l’estimateur
-        if not isinstance(Xnum, pd.DataFrame):
-            Xnum = pd.DataFrame(Xnum, columns=num_cols)
-        Xnum = Xnum.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
-        Xnum = Xnum.fillna(num_medians)
-
+    def f_np(Xarr: np.ndarray) -> np.ndarray:
+        # Xarr: (n, p_num)
+        Xnum = pd.DataFrame(Xarr, columns=num_cols)
+        Xnum = _to_float_df(Xnum, fill=num_meds)
         n = len(Xnum)
-        # répéter la ligne complète (catégorielles fixées), puis écraser les colonnes num
         Xfull = pd.DataFrame([fixed_row_full.values] * n, columns=expected_cols)
         for c in num_cols:
             Xfull[c] = Xnum[c].values
         Xfull = Xfull[expected_cols]
-        return estimator.predict_proba(Xfull)[:, 1]
+        proba = estimator.predict_proba(Xfull)[:, 1]
+        return np.asarray(proba, dtype=np.float64)
 
-    masker = shap.maskers.Independent(bg_num)
-    explainer = shap.Explainer(f_num, masker, feature_names=num_cols)
-    ex = explainer(x_row_num)
-    vals = np.array(ex.values).reshape(-1)
-    base_vals = np.array(ex.base_values).reshape(-1)
-    return vals, base_vals, num_cols, x_row_num.iloc[0].to_numpy()
+    # 4) KernelExplainer (plus tolérant aux dtypes que Explainer par défaut)
+    expl = shap.KernelExplainer(f_np, bg_np)
+    shap_vals = expl.shap_values(x_np, nsamples=200)
+    base_val = expl.expected_value
+
+    # gestion des variantes de sortie (liste vs ndarray)
+    if isinstance(shap_vals, list):
+        shap_vals = shap_vals[0]
+    if isinstance(base_val, (list, tuple, np.ndarray)):
+        base_val = np.array(base_val).reshape(-1)[0]
+
+    vals = np.array(shap_vals).reshape(-1)
+    base = np.array([base_val], dtype=np.float64).reshape(-1)
+
+    return vals, base, num_cols, x_num.iloc[0].to_numpy(dtype=np.float64)
 
 def get_quantile_series(feature: str, pool_df: pd.DataFrame, X: pd.DataFrame) -> Optional[pd.Series]:
     if feature in pool_df.columns and pd.api.types.is_numeric_dtype(pool_df[feature]):
@@ -295,7 +314,6 @@ def build_client_report_pdf(
         ]
     else:
         tbl = [["Probabilité de défaut", "—"], ["Seuil", f"{threshold:.3f}"], ["Décision", "—"], ["Niveau de risque", "—"]]
-    from reportlab.platypus import Table, TableStyle
     t = Table(tbl, hAlign="LEFT", colWidths=[7*cm, 7*cm])
     t.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
@@ -308,7 +326,6 @@ def build_client_report_pdf(
     story.append(Spacer(1, 8))
 
     story.append(Paragraph("Contributions locales (top 10)", styles["H2"]))
-    from reportlab.platypus import Table
     if shap_vals is not None and not shap_vals.empty:
         dfc = shap_vals.sort_values("abs_val", ascending=False).head(10).copy()
         dfc["effet"] = dfc["shap_value"].apply(lambda v: "↑ risque" if v > 0 else ("↓ risque" if v < 0 else "neutre"))
@@ -321,7 +338,6 @@ def build_client_report_pdf(
         t2 = Table(data, hAlign="LEFT", colWidths=[10*cm, 4*cm])
     else:
         t2 = Table([["Information", "Détail"], ["Explicabilité", "Indisponible"]], hAlign="LEFT", colWidths=[10*cm, 4*cm])
-    from reportlab.platypus import TableStyle
     t2.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
         ("BOX", (0,0), (-1,-1), 0.25, colors.black),
@@ -343,9 +359,7 @@ def build_client_report_pdf(
     for f in keys:
         v = row[f] if f in row.index else np.nan
         kv.append([str(f), "" if pd.isna(v) else str(v)])
-    from reportlab.platypus import Table
     t3 = Table(kv, hAlign="LEFT", colWidths=[9*cm, 5*cm])
-    from reportlab.platypus import TableStyle
     t3.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
         ("BOX", (0,0), (-1,-1), 0.25, colors.black),
@@ -370,9 +384,6 @@ def suggest_actions(
     top_n:int = 5,
     global_imp_df: Optional[pd.DataFrame] = None,
 ) -> tuple[list[dict], list[dict]]:
-    """
-    Retourne (axes_amelioration, points_forts), DÉDOUBLONNÉS par variable.
-    """
     def _quantiles_for(f: str):
         s = None
         if f in pool_df.columns and pd.api.types.is_numeric_dtype(pool_df[f]):
@@ -428,11 +439,11 @@ def suggest_actions(
             pos_txt = "au-dessus" if v >= q["p50"] else "en-dessous"
             return f"Point fort : valeur {pos_txt} de la médiane ({q['p50']:.2f})."
 
-    # ===== Cas 1: SHAP disponible =====
+    # Cas 1: SHAP dispo
     if shap_df is not None and not shap_df.empty and not new_x.empty:
         tmp = shap_df.copy().sort_values("abs_val", ascending=False)
-        pos = tmp[tmp["shap_value"] > 0].head(top_n)   # ↑ risque
-        neg = tmp[tmp["shap_value"] < 0].head(top_n)   # ↓ risque
+        pos = tmp[tmp["shap_value"] > 0].head(top_n)
+        neg = tmp[tmp["shap_value"] < 0].head(top_n)
         axes, strong = [], []
         row = new_x.iloc[0]
 
@@ -448,7 +459,7 @@ def suggest_actions(
         strong = [s for s in _unique_by_feature(strong) if s["feature"] not in {a["feature"] for a in axes}][:top_n]
         return axes, strong
 
-    # ===== Cas 2: Fallback sans SHAP =====
+    # Cas 2: Fallback
     axes, strong = [], []
     if global_imp_df is None or global_imp_df.empty or new_x.empty:
         return axes, strong
@@ -524,7 +535,6 @@ def build_new_client_report_pdf(
     global_imp_df: Optional[pd.DataFrame],
     shap_df: Optional[pd.DataFrame],
 ) -> bytes:
-    """PDF dédié 'Nouveau client' + message de remerciement + axes d'amélioration."""
     if not REPORTLAB_AVAILABLE:
         return b""
     from reportlab.lib import colors
@@ -545,7 +555,6 @@ def build_new_client_report_pdf(
     story.append(Paragraph("Prêt à dépenser — Résultats (Nouveau client)", styles["TitleBig"]))
     story.append(Paragraph(f"Date: {now} • App: {APP_VERSION}", styles["Small"]))
     story.append(Spacer(1, 8))
-
     story.append(Paragraph(
         "Merci pour votre confiance. Voici vos résultats actuels et, en cas de refus, des axes d’amélioration possibles.",
         styles["Small"]
@@ -1202,7 +1211,7 @@ with main_tabs[6]:
     with cols_opt[3]:
         max_sample = st.number_input("Taille échantillon (max)", min_value=1000, value=20000, step=1000)
 
-    if mode == "API FastAPI" && api_ok:
+    if mode == "API FastAPI" and api_ok:
         try:
             payload = {"cost_fp": float(cost_fp), "cost_fn": float(cost_fn), "max_sample": int(max_sample), "step": 0.001}
             m = api_metrics(api_base, payload)
