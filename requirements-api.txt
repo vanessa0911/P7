@@ -1,9 +1,10 @@
-# API only (pas de SHAP, pas de Plotly, etc.)
-fastapi>=0.110,<1
-uvicorn[standard]>=0.30,<0.31
-pydantic>=2.7,<3
+# API only – versions pinées avec wheels manylinux
+fastapi==0.110.2
+uvicorn==0.30.5          # <-- SANS [standard]
+pydantic==2.7.4
+
 numpy==1.26.4
 scipy==1.12.0
 scikit-learn==1.4.2
-pandas>=2.2,<3
-joblib>=1.3,<2
+pandas==2.2.2
+joblib==1.3.2
