@@ -1354,7 +1354,7 @@ with main_tabs[6]:
                     with apply_cols[1]:
                         st.caption("Le seuil optimal minimise le coût total attendu : `coût = FP × coût_FP + FN × coût_FN`.")
 
-# Footer
+# Footer 
 st.divider()
 footer_cols = st.columns([2,2,1])
 with footer_cols[0]:
