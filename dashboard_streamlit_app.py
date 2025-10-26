@@ -516,7 +516,7 @@ def build_new_client_report_pdf(
     story.append(Spacer(1, 8))
 
     # Axes d'amélioration / Points forts
-    axes, strong = suggest_actions(shap_df, new_x, X, pool_df, top_n=5)
+    axes, strong = suggest_actions(shap_df, new_x, X, pool_df, top_n=5, global_imp_df=global_imp_df)
     story.append(Paragraph("Axes d’amélioration (si décision = Refus)", styles["H2"]))
     if axes:
         data = [["Variable", "Valeur", "Recommandation"]]
@@ -1068,7 +1068,11 @@ with main_tabs[5]:
             st.markdown(f"**Décision (seuil {float(threshold):.3f})** : **{decision}**")
             st.markdown(f"Niveau de risque : **{band2}**")
             # ==== Recommandations & export PDF (nouveau client) ====
-            axes, strong = suggest_actions(shap_df2, new_x, X, pool_df, top_n=5)
+            used_fallback = (shap_df2 is None) or shap_df2.empty
+            axes, strong = suggest_actions(shap_df2, new_x, X, pool_df, top_n=5, global_imp_df=global_imp_df)
+
+            if used_fallback:
+                st.info("Explicabilité locale indisponible ; recommandations basées sur l’importance globale.")
 
             with st.expander("🛠️ Axes d’amélioration (si décision = Refus)"):
                 if axes:
