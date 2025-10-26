@@ -325,6 +325,226 @@ def build_client_report_pdf(
     buf.close()
     return pdf_bytes
 
+# ---- Suggestions "nouveau client" ----
+def suggest_actions(
+    shap_df: Optional[pd.DataFrame],
+    new_x: pd.DataFrame,
+    X: pd.DataFrame,
+    pool_df: pd.DataFrame,
+    top_n:int = 5
+) -> tuple[list[dict], list[dict]]:
+    """
+    Retourne (axes_amelioration, points_forts) à partir des SHAP locaux.
+    - axes_amelioration : top features avec shap_value > 0 (↑ risque)
+    - points_forts      : top features avec shap_value < 0 (↓ risque)
+    Chaque item = {"feature": str, "value": any, "note": str}
+    """
+    if shap_df is None or shap_df.empty:
+        return [], []
+
+    # Trie par contribution absolue
+    tmp = shap_df.copy().sort_values("abs_val", ascending=False)
+
+    # Sépare + et -
+    pos = tmp[tmp["shap_value"] > 0].head(top_n)   # ↑ risque
+    neg = tmp[tmp["shap_value"] < 0].head(top_n)   # ↓ risque
+
+    def _quantiles_for(f: str):
+        s = None
+        if f in pool_df.columns and pd.api.types.is_numeric_dtype(pool_df[f]):
+            s = pool_df[f]
+        elif f in X.columns and pd.api.types.is_numeric_dtype(X[f]):
+            s = X[f]
+        if s is None or s.dropna().empty:
+            return None
+        q = s.quantile([0.1, 0.5, 0.9])
+        return {"p10": float(q.loc[0.1]), "p50": float(q.loc[0.5]), "p90": float(q.loc[0.9])}
+
+    # Petites règles "métiers" pour quelques variables fréquentes
+    RULES = {
+        "CREDIT_GOODS_RATIO": "Un ratio crédit/biens plus faible (apport initial plus élevé) réduit le risque.",
+        "ANNUITY_INCOME_RATIO": "Réduire la mensualité par rapport au revenu (renégocier durée/montant) améliore la solvabilité.",
+        "CREDIT_INCOME_RATIO": "Un endettement plus faible (crédit/revenu) est attendu chez les bons dossiers.",
+        "PAYMENT_RATE": "Un taux de mensualité plus faible par rapport au crédit peut alléger la pression budgétaire.",
+        "EXT_SOURCE_1": "Les scores externes ne sont pas directement actionnables ; historique de paiement sain à maintenir.",
+        "EXT_SOURCE_2": "Renforcer l’historique de paiement et éviter les retards améliore ce signal externe.",
+        "EXT_SOURCE_3": "Même idée : régularité des paiements, pas d’incidents, solde de crédits en temps voulu.",
+        "DAYS_EMPLOYED": "Une ancienneté plus élevée stabilise le profil (si possible, éviter ruptures d’emploi).",
+        "EMPLOY_TO_AGE_RATIO": "Un ratio emploi/âge plus élevé reflète une carrière plus stable.",
+        "AGE_YEARS": "Facteur non-actionnable à court terme.",
+    }
+
+    def _mk_note(feat:str, val:Any, shap_pos:bool):
+        q = _quantiles_for(feat)
+        base = RULES.get(str(feat))
+        if base:
+            return base
+        # Fallback générique selon quantiles
+        if q is None:
+            if shap_pos:
+                return "Cette valeur accroît le risque vs profil moyen."
+            else:
+                return "Cette valeur contribue positivement vs profil moyen."
+        v = float(val) if pd.notnull(val) and str(val).replace('.','',1).replace('-','',1).isdigit() else None
+        if v is None:
+            return "Contribution basée sur la modalité/valeur observée."
+        if shap_pos:
+            # ↑ risque : propose de se rapprocher de la médiane
+            if v > q["p50"]:
+                return f"Valeur au-dessus de la médiane ({q['p50']:.2f}). Se rapprocher de la médiane peut réduire le risque."
+            else:
+                return f"Valeur en-dessous de la médiane ({q['p50']:.2f}). Se rapprocher de la médiane peut réduire le risque."
+        else:
+            # ↓ risque : valoriser le point fort
+            pos_txt = "au-dessus" if v >= q["p50"] else "en-dessous"
+            return f"Point fort : valeur {pos_txt} de la médiane ({q['p50']:.2f})."
+
+    axes, strong = [], []
+    if not new_x.empty:
+        row = new_x.iloc[0]
+    else:
+        row = pd.Series(dtype=object)
+
+    for _, r in pos.iterrows():
+        f = str(r["feature"])
+        v = row[f] if f in row.index else np.nan
+        axes.append({"feature": f, "value": v, "note": _mk_note(f, v, shap_pos=True)})
+
+    for _, r in neg.iterrows():
+        f = str(r["feature"])
+        v = row[f] if f in row.index else np.nan
+        strong.append({"feature": f, "value": v, "note": _mk_note(f, v, shap_pos=False)})
+
+    return axes, strong
+
+
+def build_new_client_report_pdf(
+    proba: Optional[float],
+    threshold: float,
+    decision: str,
+    band_label: str,
+    new_x: pd.DataFrame,
+    X: pd.DataFrame,
+    pool_df: pd.DataFrame,
+    global_imp_df: Optional[pd.DataFrame],
+    shap_df: Optional[pd.DataFrame],
+) -> bytes:
+    """PDF dédié 'Nouveau client' + message de remerciement + axes d'amélioration."""
+    if not REPORTLAB_AVAILABLE:
+        return b""
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.units import cm
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=1.5*cm, rightMargin=1.5*cm, topMargin=1.2*cm, bottomMargin=1.2*cm)
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="TitleBig", fontSize=18, leading=22, spaceAfter=12, alignment=1))
+    styles.add(ParagraphStyle(name="H2", fontSize=13, leading=16, spaceBefore=10, spaceAfter=6))
+    styles.add(ParagraphStyle(name="Small", fontSize=9, leading=12, textColor="#555555"))
+
+    story = []
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    story.append(Paragraph("Prêt à dépenser — Résultats (Nouveau client)", styles["TitleBig"]))
+    story.append(Paragraph(f"Date: {now} • App: {APP_VERSION}", styles["Small"]))
+    story.append(Spacer(1, 8))
+
+    # Message demandé
+    story.append(Paragraph(
+        "Merci pour votre confiance. Voici vos résultats actuels et, en cas de refus, des axes d’amélioration possibles.",
+        styles["Small"]
+    ))
+    story.append(Spacer(1, 6))
+
+    # Score & décision
+    story.append(Paragraph("Score & décision", styles["H2"]))
+    if proba is not None:
+        tbl = [
+            ["Probabilité de défaut", f"{proba*100:.2f} %"],
+            ["Seuil (proba défaut)", f"{threshold:.3f}"],
+            ["Décision", decision],
+            ["Niveau de risque", band_label],
+        ]
+    else:
+        tbl = [["Probabilité de défaut", "—"], ["Seuil", f"{threshold:.3f}"], ["Décision", "—"], ["Niveau de risque", "—"]]
+    t = Table(tbl, hAlign="LEFT", colWidths=[7*cm, 7*cm])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
+        ("BOX", (0,0), (-1,-1), 0.25, colors.black),
+        ("INNERGRID", (0,0), (-1,-1), 0.25, colors.grey),
+        ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
+        ("FONTSIZE", (0,0), (-1,-1), 10),
+    ]))
+    story.append(t)
+    story.append(Spacer(1, 8))
+
+    # Axes d'amélioration / Points forts
+    axes, strong = suggest_actions(shap_df, new_x, X, pool_df, top_n=5)
+    story.append(Paragraph("Axes d’amélioration (si décision = Refus)", styles["H2"]))
+    if axes:
+        data = [["Variable", "Valeur", "Recommandation"]]
+        for a in axes:
+            data.append([str(a["feature"]), "" if pd.isna(a["value"]) else str(a["value"]), a["note"]])
+        t2 = Table(data, hAlign="LEFT", colWidths=[5.5*cm, 3.0*cm, 5.5*cm])
+    else:
+        t2 = Table([["Information", "Détail"], ["Recommandations", "Aucune recommandation spécifique (explicabilité locale indisponible)."]],
+                   hAlign="LEFT", colWidths=[7*cm, 7*cm])
+    t2.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
+        ("BOX", (0,0), (-1,-1), 0.25, colors.black),
+        ("INNERGRID", (0,0), (-1,-1), 0.25, colors.grey),
+        ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
+        ("FONTSIZE", (0,0), (-1,-1), 9),
+    ]))
+    story.append(t2)
+    story.append(Spacer(1, 8))
+
+    story.append(Paragraph("Points forts du dossier", styles["H2"]))
+    if strong:
+        data = [["Variable", "Valeur", "Commentaire"]]
+        for s in strong:
+            data.append([str(s["feature"]), "" if pd.isna(s["value"]) else str(s["value"]), s["note"]])
+        t3 = Table(data, hAlign="LEFT", colWidths=[5.5*cm, 3.0*cm, 5.5*cm])
+    else:
+        t3 = Table([["Information", "Détail"], ["Points forts", "Non disponibles (explicabilité locale indisponible)."]],
+                   hAlign="LEFT", colWidths=[7*cm, 7*cm])
+    t3.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
+        ("BOX", (0,0), (-1,-1), 0.25, colors.black),
+        ("INNERGRID", (0,0), (-1,-1), 0.25, colors.grey),
+        ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
+        ("FONTSIZE", (0,0), (-1,-1), 9),
+    ]))
+    story.append(t3)
+    story.append(Spacer(1, 8))
+
+    # Contributions locales si dispo
+    story.append(Paragraph("Contributions locales (top 10)", styles["H2"]))
+    if shap_df is not None and not shap_df.empty:
+        dfc = shap_df.sort_values("abs_val", ascending=False).head(10).copy()
+        dfc["effet"] = dfc["shap_value"].apply(lambda v: "↑ risque" if v > 0 else ("↓ risque" if v < 0 else "neutre"))
+        data = [["Variable", "Valeur", "Contribution", "Effet"]] + \
+               [[str(r["feature"]), str(r["value"]), f'{r["shap_value"]:+.4f}', r["effet"]] for _, r in dfc.iterrows()]
+        t4 = Table(data, hAlign="LEFT", colWidths=[6.0*cm, 3.5*cm, 3.0*cm, 2.0*cm])
+    else:
+        t4 = Table([["Information", "Détail"], ["Explicabilité", "Indisponible"]], hAlign="LEFT", colWidths=[10*cm, 4*cm])
+    t4.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
+        ("BOX", (0,0), (-1,-1), 0.25, colors.black),
+        ("INNERGRID", (0,0), (-1,-1), 0.25, colors.grey),
+        ("ALIGN", (2,1), (2,-1), "RIGHT"),
+        ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
+        ("FONTSIZE", (0,0), (-1,-1), 9),
+    ]))
+    story.append(t4)
+
+    doc.build(story)
+    pdf_bytes = buf.getvalue()
+    buf.close()
+    return pdf_bytes
+
 # -------------------------------
 # Locate artifacts at repo root
 # -------------------------------
