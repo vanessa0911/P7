@@ -331,24 +331,15 @@ def suggest_actions(
     new_x: pd.DataFrame,
     X: pd.DataFrame,
     pool_df: pd.DataFrame,
-    top_n:int = 5
+    top_n:int = 5,
+    global_imp_df: Optional[pd.DataFrame] = None,
 ) -> tuple[list[dict], list[dict]]:
     """
-    Retourne (axes_amelioration, points_forts) à partir des SHAP locaux.
-    - axes_amelioration : top features avec shap_value > 0 (↑ risque)
-    - points_forts      : top features avec shap_value < 0 (↓ risque)
+    Retourne (axes_amelioration, points_forts).
+    - Cas 1: SHAP dispo -> s'appuie sur shap_df (positif = ↑ risque, négatif = ↓ risque)
+    - Cas 2: SHAP indispo -> fallback basé sur importance globale + position vs médiane
     Chaque item = {"feature": str, "value": any, "note": str}
     """
-    if shap_df is None or shap_df.empty:
-        return [], []
-
-    # Trie par contribution absolue
-    tmp = shap_df.copy().sort_values("abs_val", ascending=False)
-
-    # Sépare + et -
-    pos = tmp[tmp["shap_value"] > 0].head(top_n)   # ↑ risque
-    neg = tmp[tmp["shap_value"] < 0].head(top_n)   # ↓ risque
-
     def _quantiles_for(f: str):
         s = None
         if f in pool_df.columns and pd.api.types.is_numeric_dtype(pool_df[f]):
@@ -360,62 +351,106 @@ def suggest_actions(
         q = s.quantile([0.1, 0.5, 0.9])
         return {"p10": float(q.loc[0.1]), "p50": float(q.loc[0.5]), "p90": float(q.loc[0.9])}
 
-    # Petites règles "métiers" pour quelques variables fréquentes
     RULES = {
         "CREDIT_GOODS_RATIO": "Un ratio crédit/biens plus faible (apport initial plus élevé) réduit le risque.",
         "ANNUITY_INCOME_RATIO": "Réduire la mensualité par rapport au revenu (renégocier durée/montant) améliore la solvabilité.",
         "CREDIT_INCOME_RATIO": "Un endettement plus faible (crédit/revenu) est attendu chez les bons dossiers.",
         "PAYMENT_RATE": "Un taux de mensualité plus faible par rapport au crédit peut alléger la pression budgétaire.",
-        "EXT_SOURCE_1": "Les scores externes ne sont pas directement actionnables ; historique de paiement sain à maintenir.",
-        "EXT_SOURCE_2": "Renforcer l’historique de paiement et éviter les retards améliore ce signal externe.",
-        "EXT_SOURCE_3": "Même idée : régularité des paiements, pas d’incidents, solde de crédits en temps voulu.",
-        "DAYS_EMPLOYED": "Une ancienneté plus élevée stabilise le profil (si possible, éviter ruptures d’emploi).",
+        "EXT_SOURCE_1": "Scores externes non actionnables directement ; maintenir un historique de paiement sain.",
+        "EXT_SOURCE_2": "Renforcer l’historique de paiement (zéro retard) améliore ce signal externe.",
+        "EXT_SOURCE_3": "Même idée : régularité des paiements, pas d’incidents, soldes à temps.",
+        "DAYS_EMPLOYED": "Une ancienneté plus élevée stabilise le profil (éviter les ruptures d’emploi si possible).",
         "EMPLOY_TO_AGE_RATIO": "Un ratio emploi/âge plus élevé reflète une carrière plus stable.",
-        "AGE_YEARS": "Facteur non-actionnable à court terme.",
     }
 
-    def _mk_note(feat:str, val:Any, shap_pos:bool):
-        q = _quantiles_for(feat)
+    def _mk_note(feat:str, val:Any, shap_pos:bool, q:Optional[dict]):
         base = RULES.get(str(feat))
         if base:
             return base
-        # Fallback générique selon quantiles
         if q is None:
-            if shap_pos:
-                return "Cette valeur accroît le risque vs profil moyen."
-            else:
-                return "Cette valeur contribue positivement vs profil moyen."
-        v = float(val) if pd.notnull(val) and str(val).replace('.','',1).replace('-','',1).isdigit() else None
+            return "Contribution estimée vs profil moyen."
+        v = None
+        try:
+            v = float(val)
+        except Exception:
+            pass
         if v is None:
-            return "Contribution basée sur la modalité/valeur observée."
+            return "Contribution liée à la modalité observée."
         if shap_pos:
-            # ↑ risque : propose de se rapprocher de la médiane
-            if v > q["p50"]:
+            # ↑ risque: recommander de se rapprocher de la médiane
+            if v >= q["p50"]:
                 return f"Valeur au-dessus de la médiane ({q['p50']:.2f}). Se rapprocher de la médiane peut réduire le risque."
             else:
                 return f"Valeur en-dessous de la médiane ({q['p50']:.2f}). Se rapprocher de la médiane peut réduire le risque."
         else:
-            # ↓ risque : valoriser le point fort
             pos_txt = "au-dessus" if v >= q["p50"] else "en-dessous"
             return f"Point fort : valeur {pos_txt} de la médiane ({q['p50']:.2f})."
 
+    # ===== Cas 1: on a des SHAP =====
+    if shap_df is not None and not shap_df.empty:
+        tmp = shap_df.copy().sort_values("abs_val", ascending=False)
+        pos = tmp[tmp["shap_value"] > 0].head(top_n)   # ↑ risque
+        neg = tmp[tmp["shap_value"] < 0].head(top_n)   # ↓ risque
+        axes, strong = [], []
+        row = new_x.iloc[0] if not new_x.empty else pd.Series(dtype=object)
+
+        for _, r in pos.iterrows():
+            f = str(r["feature"]); v = row[f] if f in row.index else np.nan; q = _quantiles_for(f)
+            axes.append({"feature": f, "value": v, "note": _mk_note(f, v, shap_pos=True, q=q)})
+
+        for _, r in neg.iterrows():
+            f = str(r["feature"]); v = row[f] if f in row.index else np.nan; q = _quantiles_for(f)
+            strong.append({"feature": f, "value": v, "note": _mk_note(f, v, shap_pos=False, q=q)})
+
+        return axes, strong
+
+    # ===== Cas 2: Fallback sans SHAP (importance globale) =====
     axes, strong = [], []
-    if not new_x.empty:
-        row = new_x.iloc[0]
-    else:
-        row = pd.Series(dtype=object)
+    if global_imp_df is None or global_imp_df.empty or new_x.empty:
+        return axes, strong
 
-    for _, r in pos.iterrows():
-        f = str(r["feature"])
-        v = row[f] if f in row.index else np.nan
-        axes.append({"feature": f, "value": v, "note": _mk_note(f, v, shap_pos=True)})
+    row = new_x.iloc[0]
+    # Petits heuristiques de direction du risque par nom de variable
+    HIGH_IS_RISK = {"CREDIT_GOODS_RATIO", "ANNUITY_INCOME_RATIO", "CREDIT_INCOME_RATIO",
+                    "AMT_REQ_CREDIT_BUREAU_DAY","AMT_REQ_CREDIT_BUREAU_WEEK","AMT_REQ_CREDIT_BUREAU_MON",
+                    "AMT_REQ_CREDIT_BUREAU_QRT","AMT_REQ_CREDIT_BUREAU_YEAR","EXT_SOURCES_NA","DOC_COUNT"}
+    LOW_IS_RISK  = {"EXT_SOURCES_MEAN","EXT_SOURCE_1","EXT_SOURCE_2","EXT_SOURCE_3","EMPLOY_TO_AGE_RATIO","PAYMENT_RATE"}
 
-    for _, r in neg.iterrows():
-        f = str(r["feature"])
+    cand = [f for f in global_imp_df["feature"].tolist() if (f in X.columns or f in pool_df.columns)]
+    cand = cand[: max(top_n*3, 15)]  # on prend un peu large puis on trie
+
+    scored = []
+    for f in cand:
+        q = _quantiles_for(f)
+        if q is None:
+            continue
         v = row[f] if f in row.index else np.nan
-        strong.append({"feature": f, "value": v, "note": _mk_note(f, v, shap_pos=False)})
+        try:
+            v_float = float(v)
+        except Exception:
+            continue
+        spread = max(q["p90"] - q["p10"], 1e-9)
+        deviation = abs(v_float - q["p50"]) / spread  # écart relatif
+        # direction de risque approximative
+        if f in HIGH_IS_RISK:
+            shap_pos_guess = (v_float > q["p50"])
+        elif f in LOW_IS_RISK:
+            shap_pos_guess = (v_float < q["p50"])
+        else:
+            shap_pos_guess = (v_float > q["p90"] or v_float < q["p10"])
+        scored.append((f, v, q, deviation, shap_pos_guess))
+
+    # on prend les plus “éloignées” d’abord
+    scored.sort(key=lambda t: t[3], reverse=True)
+
+    for f, v, q, _, shap_pos_guess in scored[:top_n]:
+        if shap_pos_guess:
+            axes.append({"feature": f, "value": v, "note": _mk_note(f, v, True, q)})
+        else:
+            strong.append({"feature": f, "value": v, "note": _mk_note(f, v, False, q)})
 
     return axes, strong
+
 
 
 def build_new_client_report_pdf(
