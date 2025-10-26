@@ -1,9 +1,9 @@
-# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v0.9.10)
+# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v0.9.11)
 # ----------------------------------------------------------------
 # Run:
 #   python -m streamlit run dashboard_streamlit_app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true
 
-APP_VERSION = "0.9.10"
+APP_VERSION = "0.9.11"
 
 import os
 import json
@@ -76,13 +76,20 @@ def _pick_first_existing(paths: List[str]) -> Optional[str]:
     return None
 
 def _to_numeric_series(s: pd.Series) -> pd.Series:
-    """Coerce en numérique de façon sûre (garde NaN si impossible)."""
+    """Coerce en numérique (NaN si impossible)."""
     if pd.api.types.is_numeric_dtype(s):
         return pd.to_numeric(s, errors="coerce")
     try:
         return pd.to_numeric(s, errors="coerce")
     except Exception:
         return pd.Series([np.nan] * len(s), index=s.index)
+
+def ensure_columns(df: pd.DataFrame, expected: List[str]) -> pd.DataFrame:
+    """Ajoute les colonnes manquantes (NaN) et retourne df[expected] dans l'ordre exact."""
+    for c in expected:
+        if c not in df.columns:
+            df[c] = np.nan
+    return df[expected]
 
 @st.cache_data(show_spinner=False)
 def load_table(path: str) -> pd.DataFrame:
@@ -137,15 +144,13 @@ def build_global_importance_fallback(
     pool_df: pd.DataFrame,
     target_col: Optional[str]
 ) -> Optional[pd.DataFrame]:
-    """Si pas d'importance dispo, construit un ranking: corrélation absolue à TARGET, sinon variance."""
+    """Si pas d'importance dispo, construit un ranking: corrélation abs. à TARGET, sinon variance."""
     if global_imp_df is not None and not global_imp_df.empty:
         return global_imp_df
-
     if pool_df is None or pool_df.empty:
         return None
 
     df = pool_df.copy()
-    # Numérise toutes les colonnes potentiellement numériques
     num_cols = []
     for c in df.columns:
         s_num = _to_numeric_series(df[c])
@@ -154,8 +159,8 @@ def build_global_importance_fallback(
             num_cols.append(c + "___NUM")
 
     cand_cols = [c for c in num_cols if not c.endswith("TARGET___NUM") and not c.endswith("SK_ID_CURR___NUM")]
-
     scores = []
+
     if target_col and target_col in df.columns:
         y = _to_numeric_series(df[target_col])
         if y.notna().sum() > 0:
@@ -163,14 +168,12 @@ def build_global_importance_fallback(
                 x = df[c]
                 if x.notna().sum() > 0:
                     try:
-                        # corrélation (Spearman robuste aux non-linéarités)
                         rho = x.corr(y, method="spearman")
                         if np.isfinite(rho):
                             scores.append((c.replace("___NUM", ""), abs(float(rho))))
                     except Exception:
                         pass
 
-    # Si pas de corrélation possible, fallback variance/écart-type
     if not scores:
         for c in cand_cols:
             x = df[c]
@@ -184,9 +187,22 @@ def build_global_importance_fallback(
     if not scores:
         return None
 
-    out = pd.DataFrame(scores, columns=["feature", "importance"])
-    out = out.sort_values("importance", ascending=False)
+    out = pd.DataFrame(scores, columns=["feature", "importance"]).sort_values("importance", ascending=False)
     return out
+
+def get_expected_input_columns(model) -> Optional[List[str]]:
+    """Récupère les colonnes d'entrée attendues par le modèle (Pipeline/ColumnTransformer ou estimator sklearn)."""
+    try:
+        m = model
+        if isinstance(m, SkPipeline):
+            for _, step in m.steps:
+                if isinstance(step, SkColumnTransformer) and hasattr(step, "feature_names_in_"):
+                    return list(step.feature_names_in_)
+        if hasattr(m, "feature_names_in_"):
+            return list(m.feature_names_in_)
+    except Exception:
+        pass
+    return None
 
 def get_quantile_series(feature: str, pool_df: pd.DataFrame, X: pd.DataFrame) -> Optional[pd.Series]:
     if feature in pool_df.columns:
@@ -266,7 +282,7 @@ def api_metrics(base_url: str, payload: dict) -> dict:
     r.raise_for_status()
     return r.json()
 
-# ---- PDF builder ----
+# ---- PDF builder (client) ----
 def build_client_report_pdf(
     client_id: str,
     model_name: str,
@@ -305,6 +321,7 @@ def build_client_report_pdf(
         ]
     else:
         tbl = [["Probabilité de défaut", "—"], ["Seuil", f"{threshold:.3f}"], ["Décision", "—"], ["Niveau de risque", "—"]]
+    from reportlab.platypus import Table, TableStyle
     t = Table(tbl, hAlign="LEFT", colWidths=[7*cm, 7*cm])
     t.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
@@ -317,12 +334,14 @@ def build_client_report_pdf(
     story.append(Spacer(1, 8))
 
     story.append(Paragraph("Importance globale (top 10)", styles["H2"]))
+    from reportlab.platypus import Table
     if global_imp_df is not None and not global_imp_df.empty:
         dfc = global_imp_df.head(10)
         data = [["Variable", "Importance"]] + [[str(r["feature"]), f'{r["importance"]:.4f}'] for _, r in dfc.iterrows()]
         t2 = Table(data, hAlign="LEFT", colWidths=[10*cm, 4*cm])
     else:
         t2 = Table([["Information", "Détail"], ["Importance globale", "Indisponible"]], hAlign="LEFT", colWidths=[10*cm, 4*cm])
+    from reportlab.platypus import TableStyle
     t2.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
         ("BOX", (0,0), (-1,-1), 0.25, colors.black),
@@ -334,7 +353,7 @@ def build_client_report_pdf(
     story.append(t2)
     story.append(Spacer(1, 8))
 
-    story.append(Paragraph("Variables clés", styles["H2"]))
+    story.append(Paragraph("Variables clés", styles["H2"]]))
     if global_imp_df is not None and not global_imp_df.empty:
         keys = [f for f in global_imp_df["feature"].tolist() if f in X.columns][:20]
     else:
@@ -344,7 +363,9 @@ def build_client_report_pdf(
     for f in keys:
         v = row[f] if f in row.index else np.nan
         kv.append([str(f), "" if pd.isna(v) else str(v)])
+    from reportlab.platypus import Table
     t3 = Table(kv, hAlign="LEFT", colWidths=[9*cm, 5*cm])
+    from reportlab.platypus import TableStyle
     t3.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
         ("BOX", (0,0), (-1,-1), 0.25, colors.black),
@@ -376,11 +397,10 @@ def suggest_actions(
       2) Position vs médiane (p10/p50/p90) après conversion numérique sûre
       3) Garantit >= 3 axes si possible
     """
-    dbg = {"cand": 0, "numeric_cols": 0, "used_fallback": False}
+    dbg = {"cand": 0, "used_fallback": False}
     if new_x is None or new_x.empty:
         return [], [], dbg
 
-    # Heuristiques directionnelles
     HIGH_IS_RISK = {
         "CREDIT_GOODS_RATIO","ANNUITY_INCOME_RATIO","CREDIT_INCOME_RATIO",
         "AMT_REQ_CREDIT_BUREAU_DAY","AMT_REQ_CREDIT_BUREAU_WEEK","AMT_REQ_CREDIT_BUREAU_MON",
@@ -431,7 +451,6 @@ def suggest_actions(
             side = "au-dessus" if vnum >= q["p50"] else "en-dessous"
             return f"Point fort : valeur {side} de la médiane ({q['p50']:.2f})."
 
-    # Importance globale (fichier ou fallback)
     used_fallback = False
     if global_imp_df is None or global_imp_df.empty:
         used_fallback = True
@@ -439,11 +458,9 @@ def suggest_actions(
     dbg["used_fallback"] = used_fallback
 
     row = new_x.iloc[0]
-    # Candidats: top features importantes si dispo, sinon colonnes numériques détectées
     if global_imp_df is not None and not global_imp_df.empty:
         cand = [f for f in global_imp_df["feature"].astype(str).tolist() if f in row.index]
     else:
-        # repère les colonnes convertibles en numérique dans X/pool_df
         num_like = []
         for c in list(row.index):
             s_pool = get_quantile_series(c, pool_df, X)
@@ -451,12 +468,9 @@ def suggest_actions(
                 num_like.append(c)
         cand = num_like
     dbg["cand"] = len(cand)
-
     if not cand:
-        # Dernière chance: tout le vecteur, on fera au moins 3 axes génériques
         cand = list(row.index)
 
-    # Pré-score
     scored = []
     for f in cand[: max(80, top_n*8)]:
         q = _quantiles_for(f)
@@ -487,7 +501,7 @@ def suggest_actions(
             vnum, finite = None, False
 
         if q is None:
-            is_axis = f in HIGH_IS_RISK  # sans quantiles, utilise heuristiques
+            is_axis = f in HIGH_IS_RISK
         else:
             if f in HIGH_IS_RISK:
                 is_axis = (vnum is None) or (vnum >= q["p50"])
@@ -504,20 +518,17 @@ def suggest_actions(
         if len(axes) >= top_n and len(strong) >= top_n:
             break
 
-    # Filet de sécurité : au moins 3 axes
     min_axes = min(3, top_n)
     if len(axes) < min_axes:
         existing = {a["feature"] for a in axes}
         for f, v, q, _, _ in scored:
             if f in existing:
                 continue
-            # privilégie HIGH_IS_RISK si dispo
             if f in HIGH_IS_RISK or q is not None:
                 axes.append({"feature": f, "value": v, "note": _note(f, v, True, q)})
             if len(axes) >= min_axes:
                 break
     if len(axes) < min_axes:
-        # Ajoute n'importe quelles features restantes avec note générique
         existing = {a["feature"] for a in axes}
         for f, v, q, _, _ in scored:
             if f in existing:
@@ -528,6 +539,7 @@ def suggest_actions(
 
     return axes, strong, dbg
 
+# ---- PDF builder (nouveau client)
 def build_new_client_report_pdf(
     proba: Optional[float],
     threshold: float,
@@ -588,6 +600,7 @@ def build_new_client_report_pdf(
 
     story.append(Paragraph("Axes d’amélioration (si décision = Refus)", styles["H2"]))
     axes, strong, _ = suggest_actions(new_x, X, pool_df, top_n=5, global_imp_df=global_imp_df, debug=False)
+    from reportlab.platypus import Table, TableStyle
     if axes:
         data = [["Variable", "Valeur", "Recommandation"]]
         for a in axes:
@@ -670,17 +683,14 @@ with st.sidebar:
             api_ok = ok
             st.caption(f"Statut API: {'✅ OK' if ok else '❌ KO'} — {msg}")
 
-    if not DATA_TRAIN:
-        st.error("⚠️ Données non trouvées (placez `clients_demo.csv` ou `clients_demo.parquet` à la racine)")
-
 # Load datasets
 train_df = load_table(DATA_TRAIN) if DATA_TRAIN else pd.DataFrame()
 holdout_df = load_table(DATA_TEST) if DATA_TEST else pd.DataFrame()
 pool_df = train_df if not train_df.empty else holdout_df
-feature_names = load_feature_names(FEATS_PATH, list(pool_df.columns)) if not pool_df.empty else []
-global_imp_df_raw = load_global_importance(GLOBIMP)
-# Fallback si nécessaire
+
 TARGET_COL = "TARGET" if (not pool_df.empty and "TARGET" in pool_df.columns) else None
+feature_names_file = load_feature_names(FEATS_PATH, list(pool_df.columns)) if not pool_df.empty else []
+global_imp_df_raw = load_global_importance(GLOBIMP)
 global_imp_df = build_global_importance_fallback(global_imp_df_raw, pool_df, TARGET_COL)
 
 ID_COL = "SK_ID_CURR" if (not pool_df.empty and "SK_ID_CURR" in pool_df.columns) else (pool_df.columns[0] if not pool_df.empty else None)
@@ -706,24 +716,30 @@ if MODEL_BASE: model_paths["Baseline"]          = MODEL_BASE
 
 model_name_local = list(model_paths.keys())[0] if model_paths else "—"
 model_local = None
-if mode == "Local (modèle embarqué)":
-    if model_paths:
-        try:
-            model_local = safe_load_model(model_paths[model_name_local])
-        except Exception:
-            model_local = None
+if model_paths and mode == "Local (modèle embarqué)":
+    try:
+        model_local = safe_load_model(model_paths[model_name_local])
+    except Exception:
+        model_local = None
 
-# Préparer X aligné pour affichages
+# Préparer X aligné pour affichages (IMPORTANT : colonnes = colonnes attendues par le modèle si dispo)
 if not pool_df.empty and selected_id is not None:
     df_idx = pool_df.set_index(ID_COL)
-    expected_cols_local = feature_names or list(df_idx.columns)
-    for c in expected_cols_local:
-        if c not in df_idx.columns:
-            df_idx[c] = np.nan
-    X = df_idx[expected_cols_local]
-    x_row = X.loc[[selected_id]]
+    expected_cols_local = None
+    if model_local is not None:
+        expected_cols_local = get_expected_input_columns(model_local)
+    if expected_cols_local is None:
+        expected_cols_local = feature_names_file or list(df_idx.columns)
+    # ajoute colonnes manquantes + ordre exact
+    df_idx = ensure_columns(df_idx, expected_cols_local)
+    X = df_idx
+    # ligne client
+    if selected_id in X.index:
+        x_row = X.loc[[selected_id]]
+    else:
+        x_row = X.head(0)
 else:
-    X = pd.DataFrame(columns=feature_names)
+    X = pd.DataFrame(columns=feature_names_file)
     x_row = X.head(0)
 
 # -------------------------------
@@ -748,7 +764,6 @@ with main_tabs[0]:
     proba = None
     source_label = "Local"
 
-    # PREDICT
     if mode == "API FastAPI":
         if not api_base or not api_ok:
             st.error("API indisponible.")
@@ -759,7 +774,7 @@ with main_tabs[0]:
                 proba = float(resp["proba_default"])
                 source_label = "API"
             except Exception as e:
-                st.warning(f"API KO ({e}).")
+                st.error(f"API KO: {e}")
     else:
         if model_local is None or x_row.empty:
             st.warning("Modèle local ou données indisponibles.")
@@ -767,7 +782,7 @@ with main_tabs[0]:
             try:
                 proba = float(model_local.predict_proba(x_row)[0, 1])
             except Exception as e:
-                st.error(f"Prédiction locale impossible: {e}")
+                st.error(f"Échec de la prédiction: {e}")
 
     if proba is not None:
         band, color = prob_to_band(float(proba), low=0.05, high=0.15)
@@ -800,7 +815,7 @@ with main_tabs[0]:
                 figb.update_layout(title="Top 10 — Importance globale (sans SHAP local)")
                 st.plotly_chart(figb, use_container_width=True)
             else:
-                st.info("Importance globale indisponible (même le fallback n’a rien trouvé).")
+                st.info("Importance globale indisponible.")
     else:
         st.info("Probabilité non disponible.")
 
@@ -885,7 +900,7 @@ with main_tabs[2]:
                 if s_pop is None or s_pop.dropna().empty:
                     continue
                 s_coh = get_cohort_series(f, cohort_df, X, ID_COL)
-                client_val = _to_numeric_series(x_row[f]) .iloc[0] if f in X.columns else np.nan
+                client_val = _to_numeric_series(x_row[f]).iloc[0] if f in X.columns else np.nan
 
                 pop_q = s_pop.quantile([0.1, 0.5, 0.9]).values
                 if s_coh is not None and not s_coh.dropna().empty:
@@ -977,14 +992,13 @@ with main_tabs[5]:
             st.error(f"Impossible de lire le CSV : {e}")
 
     if new_x is not None:
-        # réaligner
+        # réaligner au même jeu de colonnes que X (donc celles attendues par le modèle si dispo)
         exp_cols = list(X.columns)
         for c in exp_cols:
             if c not in new_x.columns:
                 new_x[c] = np.nan
         new_x = new_x[exp_cols]
 
-        # prédiction
         new_p = None
         if mode == "API FastAPI":
             if not api_base or not api_ok:
@@ -1094,8 +1108,7 @@ with main_tabs[6]:
     with cols_opt[3]:
         max_sample = st.number_input("Taille échantillon (max)", min_value=1000, value=20000, step=1000)
 
-    # Pas modifié par rapport à l'existant — garde l'optimisation du seuil
-    st.caption("Optimisation du seuil inchangée (non affichée ici pour concision).")
+    # (Garde la logique d'optimisation locale/API d’origine si tu en avais besoin — non recopiée ici par souci de concision)
 
 # Footer
 st.divider()
