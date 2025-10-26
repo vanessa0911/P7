@@ -1,9 +1,9 @@
-# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v1.3.0)
+# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v1.4.0)
 # ----------------------------------------------------------------
 # Run:
 #   python -m streamlit run dashboard_streamlit_app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 
 import os
 import json
@@ -75,7 +75,7 @@ def _pick_first_existing(paths: List[str]) -> Optional[str]:
             return p
     return None
 
-def fmt_int(n: int) -> str:
+def fmt_int(n: Any) -> str:
     try:
         return f"{int(n):,}".replace(",", " ")
     except Exception:
@@ -86,7 +86,6 @@ def fmt_num(x, decimals=2) -> str:
         if pd.isna(x):
             return "—"
         s = f"{float(x):,.{decimals}f}"
-        # milliers avec espace, décimales avec virgule à la française
         return s.replace(",", " ").replace(".", ",")
     except Exception:
         return str(x)
@@ -152,40 +151,43 @@ def get_expected_input_columns(model) -> Optional[List[str]]:
         pass
     return None
 
-# ---------- Numeric coercion (pour Comparaison, quantiles, etc.) ----------
-def _coerce_numeric(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    out = df.copy()
-    obj_cols = out.select_dtypes(include=["object"]).columns
-    for c in obj_cols:
-        out[c] = pd.to_numeric(out[c], errors="coerce")
-    for c in out.columns:
-        if pd.api.types.is_numeric_dtype(out[c]):
-            out[c] = pd.to_numeric(out[c], errors="coerce")
-            out[c].replace([np.inf, -np.inf], np.nan, inplace=True)
-    return out
-
-# ---------- SHAP local ----------
+# ---------- SHAP local (robuste avec fallback permutation) ----------
 def compute_local_shap(estimator, X_background: pd.DataFrame, x_row: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     import shap
-    bg = X_background
+    # Échantillon de fond limité
+    bg = X_background.copy()
     if len(bg) > 200:
         bg = bg.sample(200, random_state=42)
+
+    # Fonction modèle : garantit l'ordre & les noms de colonnes attendues
+    expected_cols = list(bg.columns)
 
     def f(Xdf):
         import pandas as pd
         if not isinstance(Xdf, pd.DataFrame):
-            Xdf = pd.DataFrame(Xdf, columns=list(bg.columns))
-        Xdf = Xdf.reindex(columns=list(bg.columns))
+            Xdf = pd.DataFrame(Xdf, columns=expected_cols)
+        else:
+            Xdf = Xdf.reindex(columns=expected_cols)
         return estimator.predict_proba(Xdf)[:, 1]
 
-    masker = shap.maskers.Independent(bg)
-    explainer = shap.Explainer(f, masker, feature_names=list(bg.columns))
-    ex = explainer(x_row)
-    return np.array(ex.values).reshape(-1), np.array(ex.base_values).reshape(-1)
+    # 1) Tentative standard (masker Independent)
+    try:
+        masker = shap.maskers.Independent(bg)
+        explainer = shap.Explainer(f, masker, feature_names=expected_cols)
+        ex = explainer(x_row.reindex(columns=expected_cols))
+        return np.array(ex.values).reshape(-1), np.array(ex.base_values).reshape(-1)
+    except Exception:
+        pass
 
-# ---------- Utils pour quantiles / cohortes ----------
+    # 2) Fallback robuste : Permutation explainer (peu sensible aux dtypes)
+    try:
+        explainer_perm = shap.explainers.Permutation(f, bg)
+        ex = explainer_perm(x_row.reindex(columns=expected_cols))
+        return np.array(ex.values).reshape(-1), np.array(ex.base_values).reshape(-1)
+    except Exception as e2:
+        raise RuntimeError(f"SHAP indisponible (y compris permutation): {e2}")
+
+# ---------- Utils quantiles / cohortes ----------
 def get_quantile_series(feature: str, pool_df: pd.DataFrame, X: pd.DataFrame) -> Optional[pd.Series]:
     if feature in pool_df.columns and pd.api.types.is_numeric_dtype(pool_df[feature]):
         return pool_df[feature]
@@ -420,15 +422,12 @@ def suggest_actions(
         neg = tmp[tmp["shap_value"] < 0].head(top_n)
         axes, strong = [], []
         row = new_x.iloc[0]
-
         for _, r in pos.iterrows():
             f = str(r["feature"]); v = row[f] if f in row.index else np.nan; q = _quantiles_for(f)
-            axes.append({"feature": f, "value": v, "note": _mk_note(f, v, shap_pos=True,  q=q)})
-
+            axes.append({"feature": f, "value": v, "note": _mk_note(f, v, True,  q)})
         for _, r in neg.iterrows():
             f = str(r["feature"]); v = row[f] if f in row.index else np.nan; q = _quantiles_for(f)
-            strong.append({"feature": f, "value": v, "note": _mk_note(f, v, shap_pos=False, q=q)})
-
+            strong.append({"feature": f, "value": v, "note": _mk_note(f, v, False, q)})
         return axes, strong
 
     axes, strong = [], []
@@ -455,27 +454,22 @@ def suggest_actions(
             continue
         q = s.quantile([0.1, 0.5, 0.9])
         qd = {"p10": float(q.loc[0.1]), "p50": float(q.loc[0.5]), "p90": float(q.loc[0.9])}
-
         v = row[f] if f in row.index else np.nan
         try:
             v_float = float(v)
         except Exception:
             continue
-
         spread = max(qd["p90"] - qd["p10"], 1e-9)
         deviation = abs(v_float - qd["p50"]) / spread
-
         if f in HIGH_IS_RISK:
             shap_pos_guess = (v_float > qd["p50"])
         elif f in LOW_IS_RISK:
             shap_pos_guess = (v_float < qd["p50"])
         else:
             shap_pos_guess = (v_float > qd["p90"] or v_float < qd["p10"])
-
         scored.append((f, v, qd, deviation, shap_pos_guess))
 
     scored.sort(key=lambda t: t[3], reverse=True)
-
     for f, v, qd, _, shap_pos_guess in scored[:top_n]:
         if shap_pos_guess:
             axes.append({"feature": f, "value": v, "note": _mk_note(f, v, True,  qd)})
@@ -499,116 +493,6 @@ def suggest_actions(
         axes = forced
 
     return axes, strong
-
-def build_new_client_report_pdf(
-    proba: Optional[float],
-    threshold: float,
-    decision: str,
-    band_label: str,
-    new_x: pd.DataFrame,
-    X: pd.DataFrame,
-    pool_df: pd.DataFrame,
-    global_imp_df: Optional[pd.DataFrame],
-    shap_df: Optional[pd.DataFrame],
-) -> bytes:
-    if not REPORTLAB_AVAILABLE:
-        return b""
-    buf = BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=1.5*cm, rightMargin=1.5*cm, topMargin=1.2*cm, bottomMargin=1.2*cm)
-    styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="TitleBig", fontSize=18, leading=22, spaceAfter=12, alignment=1))
-    styles.add(ParagraphStyle(name="H2", fontSize=13, leading=16, spaceBefore=10, spaceAfter=6))
-    styles.add(ParagraphStyle(name="Small", fontSize=9, leading=12, textColor="#555555"))
-
-    story = []
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    story.append(Paragraph("Prêt à dépenser — Résultats (Nouveau client)", styles["TitleBig"]))
-    story.append(Paragraph(f"Date: {now} • App: {APP_VERSION}", styles["Small"]))
-    story.append(Spacer(1, 8))
-
-    story.append(Paragraph("Score & décision", styles["H2"]))
-    if proba is not None:
-        tbl = [
-            ["Probabilité de défaut", f"{proba*100:.2f} %"],
-            ["Seuil (proba défaut)", f"{threshold:.3f}"],
-            ["Décision", decision],
-            ["Niveau de risque", band_label],
-        ]
-    else:
-        tbl = [["Probabilité de défaut", "—"], ["Seuil", f"{threshold:.3f}"], ["Décision", "—"], ["Niveau de risque", "—"]]
-    t = Table(tbl, hAlign="LEFT", colWidths=[7*cm, 7*cm])
-    t.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
-        ("BOX", (0,0), (-1,-1), 0.25, colors.black),
-        ("INNERGRID", (0,0), (-1,-1), 0.25, colors.grey),
-        ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
-        ("FONTSIZE", (0,0), (-1,-1), 10),
-    ]))
-    story.append(t)
-    story.append(Spacer(1, 8))
-
-    axes, strong = suggest_actions(shap_df, new_x, X, pool_df, top_n=5, global_imp_df=global_imp_df)
-    story.append(Paragraph("Axes d’amélioration (si décision = Refus)", styles["H2"]))
-    if axes:
-        data = [["Variable", "Valeur", "Recommandation"]]
-        for a in axes:
-            data.append([str(a["feature"]), "" if pd.isna(a["value"]) else str(a["value"]), a["note"]])
-        t2 = Table(data, hAlign="LEFT", colWidths=[5.5*cm, 3.0*cm, 5.5*cm])
-    else:
-        t2 = Table([["Information", "Détail"], ["Recommandations", "Aucune recommandation spécifique (explicabilité locale indisponible)."]],
-                   hAlign="LEFT", colWidths=[7*cm, 7*cm])
-    t2.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
-        ("BOX", (0,0), (-1,-1), 0.25, colors.black),
-        ("INNERGRID", (0,0), (-1,-1), 0.25, colors.grey),
-        ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
-        ("FONTSIZE", (0,0), (-1,-1), 9),
-    ]))
-    story.append(t2)
-    story.append(Spacer(1, 8))
-
-    story.append(Paragraph("Points forts du dossier", styles["H2"]))
-    if strong:
-        data = [["Variable", "Valeur", "Commentaire"]]
-        for s in strong:
-            data.append([str(s["feature"]), "" if pd.isna(s["value"]) else str(s["value"]), s["note"]])
-        t3 = Table(data, hAlign="LEFT", colWidths=[5.5*cm, 3.0*cm, 5.5*cm])
-    else:
-        t3 = Table([["Information", "Détail"], ["Points forts", "Non disponibles (explicabilité locale indisponible)."]],
-                   hAlign="LEFT", colWidths=[7*cm, 7*cm])
-    t3.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
-        ("BOX", (0,0), (-1,-1), 0.25, colors.black),
-        ("INNERGRID", (0,0), (-1,-1), 0.25, colors.grey),
-        ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
-        ("FONTSIZE", (0,0), (-1,-1), 9),
-    ]))
-    story.append(t3)
-    story.append(Spacer(1, 8))
-
-    story.append(Paragraph("Contributions locales (top 10)", styles["H2"]))
-    if shap_df is not None and not shap_df.empty:
-        dfc = shap_df.sort_values("abs_val", ascending=False).head(10).copy()
-        dfc["effet"] = dfc["shap_value"].apply(lambda v: "↑ risque" if v > 0 else ("↓ risque" if v < 0 else "neutre"))
-        data = [["Variable", "Valeur", "Contribution", "Effet"]] + \
-               [[str(r["feature"]), str(r["value"]), f'{r["shap_value"]:+.4f}', r["effet"]] for _, r in dfc.iterrows()]
-        t4 = Table(data, hAlign="LEFT", colWidths=[6.0*cm, 3.5*cm, 3.0*cm, 2.0*cm])
-    else:
-        t4 = Table([["Information", "Détail"], ["Explicabilité", "Indisponible"]], hAlign="LEFT", colWidths=[10*cm, 4*cm])
-    t4.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
-        ("BOX", (0,0), (-1,-1), 0.25, colors.black),
-        ("INNERGRID", (0,0), (-1,-1), 0.25, colors.grey),
-        ("ALIGN", (2,1), (2,-1), "RIGHT"),
-        ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
-        ("FONTSIZE", (0,0), (-1,-1), 9),
-    ]))
-    story.append(t4)
-
-    doc.build(story)
-    pdf_bytes = buf.getvalue()
-    buf.close()
-    return pdf_bytes
 
 # -------------------------------
 # Locate artifacts at repo root
@@ -789,13 +673,13 @@ with main_tabs[0]:
         st.markdown("**Contributions locales (Top 10)**")
 
         def _bar_from_df(df: pd.DataFrame, title: str) -> go.Figure:
-            tmp = df.copy()
-            tmp = tmp.sort_values("abs_val").tail(10)
+            tmp = df.copy().sort_values("abs_val").tail(10)
             x_vals = np.asarray(tmp["shap_value"].values, dtype=float)
             y_vals = tmp["feature"].astype(str).tolist()
             hover = [f"valeur: {v}" for v in tmp["value"]]
             figb = go.Figure(go.Bar(x=x_vals, y=y_vals, orientation="h", hovertext=hover, hoverinfo="text+x+y"))
             figb.update_layout(title=title)
+            figb.add_vline(x=0, line_width=1, line_dash="dash", line_color="black")
             return figb
 
         if mode == "API FastAPI" and shap_df is not None and not shap_df.empty:
@@ -803,39 +687,27 @@ with main_tabs[0]:
         else:
             shap_enabled = st.toggle("Activer SHAP local (expérimental)", value=False)
             if shap_enabled and not background.empty and model_local is not None:
-                non_num = [c for c in X.columns if not pd.api.types.is_numeric_dtype(background[c])]
-                if non_num:
-                    st.info("Explicabilité locale indisponible (colonnes non numériques détectées). "
-                            "Affichage de l'importance globale à la place.")
+                try:
+                    vals, base_vals = compute_local_shap(model_local, background, x_row)
+                    shap_df_local = pd.DataFrame({
+                        "feature": list(X.columns),
+                        "shap_value": vals,
+                        "abs_val": np.abs(vals),
+                        "value": x_row.iloc[0].values,
+                    }).sort_values("abs_val", ascending=False)
+                    st.plotly_chart(_bar_from_df(shap_df_local, "Impact sur le score (positif = ↑ risque)"),
+                                    use_container_width=True)
+                except Exception as e:
                     if global_imp_df is not None and not global_imp_df.empty:
+                        st.info("Explicabilité locale indisponible. Affichage de l'importance globale.")
                         tmp = global_imp_df.head(10).copy()
                         x_vals = np.asarray(tmp["importance"].values, dtype=float)
                         y_vals = tmp["feature"].astype(str).tolist()
                         figb = go.Figure(go.Bar(x=x_vals, y=y_vals, orientation="h"))
                         figb.update_layout(title="Top 10 — Importance globale")
                         st.plotly_chart(figb, use_container_width=True)
-                else:
-                    try:
-                        vals, base_vals = compute_local_shap(model_local, background, x_row)
-                        shap_df_local = pd.DataFrame({
-                            "feature": list(X.columns),
-                            "shap_value": vals,
-                            "abs_val": np.abs(vals),
-                            "value": x_row.iloc[0].values,
-                        }).sort_values("abs_val", ascending=False)
-                        st.plotly_chart(_bar_from_df(shap_df_local, "Impact sur le score (positif = ↑ risque)"),
-                                        use_container_width=True)
-                    except Exception:
-                        if global_imp_df is not None and not global_imp_df.empty:
-                            st.info("Explicabilité locale indisponible. Affichage de l'importance globale.")
-                            tmp = global_imp_df.head(10).copy()
-                            x_vals = np.asarray(tmp["importance"].values, dtype=float)
-                            y_vals = tmp["feature"].astype(str).tolist()
-                            figb = go.Figure(go.Bar(x=x_vals, y=y_vals, orientation="h"))
-                            figb.update_layout(title="Top 10 — Importance globale")
-                            st.plotly_chart(figb, use_container_width=True)
-                        else:
-                            st.info("Importance globale indisponible.")
+                    else:
+                        st.info("Importance globale indisponible.")
             else:
                 if global_imp_df is not None and not global_imp_df.empty:
                     tmp = global_imp_df.head(10).copy()
@@ -892,13 +764,9 @@ with main_tabs[1]:
 # -------------------------------
 with main_tabs[2]:
     st.subheader("Comparaison du client")
-
     if X.empty:
         st.info("Données indisponibles pour la comparaison.")
     else:
-        pool_df_num = _coerce_numeric(pool_df)
-        X_num = _coerce_numeric(X)
-
         st.markdown("**Définir le groupe de comparaison**")
         candidate_cohorts = [c for c in [
             "CODE_GENDER", "NAME_EDUCATION_TYPE", "NAME_INCOME_TYPE", "ORGANIZATION_TYPE",
@@ -916,51 +784,28 @@ with main_tabs[2]:
 
         st.caption(f"Taille de la cohorte similaire : **{fmt_int(len(cohort_df))}**")
 
+        # Choix de 8 variables numériques montrables
         if global_imp_df is not None and not global_imp_df.empty:
-            candidates = [f for f in global_imp_df["feature"].tolist() if f in X_num.columns]
+            cand = [f for f in global_imp_df["feature"].tolist() if f in pool_df.columns]
         else:
-            candidates = [f for f in X_num.columns]
+            cand = [f for f in pool_df.columns]
+        num_feats = [f for f in cand if pd.api.types.is_numeric_dtype(pool_df[f])][:8]
 
-        def _is_numeric_ok(col: str) -> bool:
-            s = pool_df_num[col] if col in pool_df_num.columns else X_num[col]
-            s = pd.to_numeric(s, errors="coerce")
-            return s.notna().sum() > 0
-
-        num_candidates = [f for f in candidates if f in X_num.columns and _is_numeric_ok(f)]
-        comp_feats = num_candidates[:8]
-        if len(comp_feats) < 8:
-            others = [f for f in X_num.columns if f not in comp_feats and _is_numeric_ok(f)]
-            comp_feats += others[: 8 - len(comp_feats)]
-
-        if not comp_feats:
+        if not num_feats:
             st.info("Aucune variable numérique comparable disponible.")
         else:
             long_rows = []
-            cohort_df_num = _coerce_numeric(cohort_df)
-            for f in comp_feats:
-                if f in pool_df_num.columns:
-                    s_pop = pd.to_numeric(pool_df_num[f], errors="coerce")
-                else:
-                    s_pop = pd.to_numeric(X_num[f], errors="coerce")
+            for f in num_feats:
+                s_pop = pd.to_numeric(pool_df[f], errors="coerce")
                 if s_pop.dropna().empty:
                     continue
-
-                s_coh = pd.Series(dtype=float)
-                if f in cohort_df_num.columns:
-                    s_coh = pd.to_numeric(cohort_df_num[f], errors="coerce")
-
-                client_val = np.nan
+                s_coh = pd.to_numeric(cohort_df[f], errors="coerce") if f in cohort_df.columns else pd.Series(dtype=float)
                 try:
-                    client_val = float(X_num.at[selected_id, f]) if f in X_num.columns and pd.notnull(X_num.at[selected_id, f]) else np.nan
+                    client_val = float(X.at[selected_id, f]) if f in X.columns and pd.notnull(X.at[selected_id, f]) else np.nan
                 except Exception:
-                    pass
-
+                    client_val = np.nan
                 pop_q = s_pop.quantile([0.1, 0.5, 0.9]).values
-                if not s_coh.dropna().empty:
-                    coh_q = s_coh.quantile([0.1, 0.5, 0.9]).values
-                else:
-                    coh_q = [np.nan, np.nan, np.nan]
-
+                coh_q = s_coh.quantile([0.1, 0.5, 0.9]).values if not s_coh.dropna().empty else [np.nan, np.nan, np.nan]
                 long_rows += [
                     {"feature": f, "group": "Population", "p10": pop_q[0], "p50": pop_q[1], "p90": pop_q[2], "client": client_val},
                     {"feature": f, "group": "Cohorte similaire", "p10": coh_q[0], "p50": coh_q[1], "p90": coh_q[2], "client": client_val},
@@ -979,25 +824,17 @@ with main_tabs[2]:
                     y_feat = sub["feature"].astype(str).tolist()
 
                     figc = go.Figure()
-                    figc.add_trace(go.Scatter(
-                        x=x_p10, y=y_feat, mode="markers", name="P10",
-                        hovertemplate="Variable: %{y}<br>P10: %{x:.2f}<extra></extra>"))
-                    figc.add_trace(go.Scatter(
-                        x=x_p50, y=y_feat, mode="markers", name="P50",
-                        hovertemplate="Variable: %{y}<br>P50: %{x:.2f}<extra></extra>"))
-                    figc.add_trace(go.Scatter(
-                        x=x_p90, y=y_feat, mode="markers", name="P90",
-                        hovertemplate="Variable: %{y}<br>P90: %{x:.2f}<extra></extra>"))
-                    figc.add_trace(go.Scatter(
-                        x=x_cli, y=y_feat, mode="markers", name="Client",
-                        marker=dict(symbol="diamond", size=12),
-                        hovertemplate="Variable: %{y}<br>Client: %{x:.2f}<extra></extra>"))
-                    # Séparateurs : décimale virgule, millier espace
-                    figc.update_layout(
-                        title=f"{grp} — Positionnement du client (P10/P50/P90)",
-                        height=420,
-                        separators=", "  # decimal = ',', thousands = ' '
-                    )
+                    figc.add_trace(go.Scatter(x=x_p10, y=y_feat, mode="markers", name="P10",
+                                              hovertemplate="Variable: %{y}<br>P10: %{x:.2f}<extra></extra>"))
+                    figc.add_trace(go.Scatter(x=x_p50, y=y_feat, mode="markers", name="P50",
+                                              hovertemplate="Variable: %{y}<br>P50: %{x:.2f}<extra></extra>"))
+                    figc.add_trace(go.Scatter(x=x_p90, y=y_feat, mode="markers", name="P90",
+                                              hovertemplate="Variable: %{y}<br>P90: %{x:.2f}<extra></extra>"))
+                    figc.add_trace(go.Scatter(x=x_cli, y=y_feat, mode="markers", name="Client",
+                                              marker=dict(symbol="diamond", size=12),
+                                              hovertemplate="Variable: %{y}<br>Client: %{x:.2f}<extra></extra>"))
+                    figc.update_layout(title=f"{grp} — Positionnement du client (P10/P50/P90)",
+                                       height=420, separators=", ")
                     st.plotly_chart(figc, use_container_width=True)
 
 # -------------------------------
@@ -1066,6 +903,9 @@ with main_tabs[4]:
                 new_x[c] = np.nan
         new_x = new_x[exp_cols]
 
+        # On mémorise la dernière ligne "nouveau client" pour la page Ratios
+        st.session_state["last_new_client_row"] = new_x.copy()
+
         if mode == "API FastAPI":
             if not api_base or not api_ok:
                 st.error("API indisponible pour scorer le nouveau client.")
@@ -1095,20 +935,16 @@ with main_tabs[4]:
             else:
                 try:
                     new_p = float(model_local.predict_proba(new_x)[0, 1])
-                    non_num_new = [c for c in X.columns if not pd.api.types.is_numeric_dtype(background[c])]
-                    if non_num_new:
+                    try:
+                        vals, _ = compute_local_shap(model_local, background, new_x)
+                        shap_df2 = pd.DataFrame({
+                            "feature": list(X.columns),
+                            "shap_value": vals,
+                            "abs_val": np.abs(vals),
+                            "value": new_x.iloc[0].values,
+                        }).sort_values("abs_val", ascending=False).head(10)
+                    except Exception:
                         shap_df2 = None
-                    else:
-                        try:
-                            vals, _ = compute_local_shap(model_local, background, new_x)
-                            shap_df2 = pd.DataFrame({
-                                "feature": list(X.columns),
-                                "shap_value": vals,
-                                "abs_val": np.abs(vals),
-                                "value": new_x.iloc[0].values,
-                            }).sort_values("abs_val", ascending=False).head(10)
-                        except Exception:
-                            shap_df2 = None
                 except Exception as e:
                     st.error(f"Échec de la prédiction: {e}")
                     new_p, shap_df2 = None, None
@@ -1162,7 +998,6 @@ with main_tabs[4]:
                 else:
                     st.info("Non disponible (explicabilité locale indisponible).")
 
-            # ➕ Tableau des contributions SHAP (top 10) avec SHAP & Effet
             if shap_df2 is not None and not shap_df2.empty:
                 tmp = shap_df2.copy().sort_values("abs_val", ascending=False).head(10)
                 tmp = tmp.assign(
@@ -1174,7 +1009,6 @@ with main_tabs[4]:
                 st.markdown("**Contributions locales (SHAP) — top 10**")
                 st.dataframe(tmp, use_container_width=True)
 
-                # Bar chart avec ligne verticale à 0
                 tmp2 = shap_df2.copy().sort_values("abs_val").tail(10)
                 x_vals = np.asarray(tmp2["shap_value"].values, dtype=float)
                 y_vals = tmp2["feature"].astype(str).tolist()
@@ -1189,16 +1023,16 @@ with main_tabs[4]:
                 st.warning("Le module **reportlab** n'est pas installé. `pip install reportlab` puis relancez l'app.")
             else:
                 try:
-                    pdf_new = build_new_client_report_pdf(
-                        proba=float(new_p),
+                    pdf_new = build_client_report_pdf(
+                        client_id="Nouveau client",
+                        model_name=f"{mode.split()[0]}",
                         threshold=float(threshold),
-                        decision=decision,
-                        band_label=band2,
-                        new_x=new_x,
+                        proba=float(new_p),
+                        x_row=new_x,
                         X=X,
                         pool_df=pool_df,
                         global_imp_df=global_imp_df,
-                        shap_df=shap_df2
+                        shap_vals=(shap_df2 if shap_df2 is not None and not shap_df2.empty else None),
                     )
                     fname = f"nouveau_client_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
                     st.download_button("📄 Télécharger le PDF (nouveau client)",
@@ -1208,9 +1042,10 @@ with main_tabs[4]:
                     st.error(f"Échec génération PDF nouveau client : {e}")
 
 # -------------------------------
-# Tab 6 — Dictionnaire des variables
+# Tab 6 — Dictionnaire des variables (traduction TOUTES colonnes)
 # -------------------------------
-FEATURE_LABELS = {
+# Dicos spécifiques (prioritaires)
+FEATURE_LABELS_SPEC = {
     "SK_ID_CURR": "Identifiant client",
     "CODE_GENDER": "Sexe",
     "FLAG_OWN_CAR": "Possède une voiture",
@@ -1242,139 +1077,193 @@ FEATURE_LABELS = {
     "CHILDREN_RATIO": "Enfants / Ménage",
     "DOC_COUNT": "Nb. documents fournis",
     "MISSING_COUNT_ROW": "Nb. champs manquants (ligne)",
-    "HOUSETYPE_MODE": "Type de murs/maison (mode)",
+    "HOUSETYPE_MODE": "Type de logement (mode)",
     "WALLSMATERIAL_MODE": "Matériaux des murs (mode)",
     "FONDKAPREMONT_MODE": "Fonds de rénovation (mode)",
-    "NAME_TYPE_SUITE": "Type d'accompagnant",
+    "NAME_TYPE_SUITE": "Accompagnant",
     "NAME_CONTRACT_TYPE": "Type de contrat",
-    "REGION_RATING_CLIENT": "Rating de la région",
-    "AGE_BIN": "Tranche d'âge"
+    "REGION_RATING_CLIENT": "Indice région (rating)",
+    "AGE_BIN": "Tranche d'âge",
 }
 
-FEATURE_DESCRIPTIONS = {
-    "CODE_GENDER": "Catégoriel. Sexe du client.",
-    "FLAG_OWN_CAR": "Binaire. 1 si le client possède un véhicule.",
-    "FLAG_OWN_REALTY": "Binaire. 1 si le client possède un bien immobilier.",
-    "NAME_EDUCATION_TYPE": "Catégoriel. Plus le niveau est élevé, plus la stabilité attendue peut être forte (à confirmer selon données).",
-    "NAME_INCOME_TYPE": "Catégoriel. Type principal de revenu (salarié, indépendant, retraite, etc.).",
-    "AGE_YEARS": "Âge du client en années (généralement dérivé de DAYS_BIRTH).",
-    "EMPLOY_YEARS": "Ancienneté professionnelle (généralement dérivée de DAYS_EMPLOYED).",
-    "AMT_CREDIT": "Montant total du crédit demandé/accordé.",
-    "AMT_ANNUITY": "Mensualité associée au crédit.",
-    "AMT_GOODS_PRICE": "Montant des biens financés (prix d'achat).",
-    "EXT_SOURCE_1": "Score externe (source 1, normalisé).",
-    "EXT_SOURCE_2": "Score externe (source 2, normalisé).",
-    "EXT_SOURCE_3": "Score externe (source 3, normalisé).",
-    "EXT_SOURCES_MEAN": "Moyenne des scores externes disponibles.",
-    "PAYMENT_RATE": "Rapport de la mensualité sur le montant du crédit (plus faible = moins de pression budgétaire).",
-    "CREDIT_INCOME_RATIO": "Rapport du crédit sur le revenu (plus élevé = plus de charge).",
-    "ANNUITY_INCOME_RATIO": "Rapport de la mensualité sur le revenu.",
-    "CREDIT_GOODS_RATIO": "Rapport du crédit au prix des biens (≈ 1 si pas d'apport, < 1 si apport).",
-    "EMPLOY_TO_AGE_RATIO": "Ancienneté pro rapportée à l'âge (stabilité).",
-    "INCOME_PER_PERSON": "Revenu divisé par le nombre de personnes du ménage.",
-    "CHILDREN_RATIO": "Nombre d'enfants rapporté au ménage.",
-    "DOC_COUNT": "Nombre total de documents fournis.",
-    "MISSING_COUNT_ROW": "Nombre de champs manquants pour ce dossier.",
-    "REGION_RATING_CLIENT": "Indice de risque/rating associé à la région du client.",
-}
+# Heuristiques génériques (appliquées si non dans SPEC)
+def french_label(col: str) -> str:
+    if col in FEATURE_LABELS_SPEC:
+        return FEATURE_LABELS_SPEC[col]
+    c = col.upper()
+
+    # Patterns courants
+    repl = [
+        ("AMT_", "Montant "),
+        ("CNT_", "Nombre "),
+        ("DAYS_", "Jours "),
+        ("YEARS", "Années"),
+        ("HOUR", "Heure"),
+        ("MIN", "Minute"),
+        ("SEC", "Seconde"),
+        ("FLAG_", "Indicateur "),
+        ("NAME_", "Libellé "),
+        ("EXT_SOURCE_", "Score externe "),
+        ("EXT_SOURCES_", "Scores externes "),
+        ("REGION_", "Région "),
+        ("ORGANIZATION_TYPE", "Secteur employeur"),
+        ("WEEKDAY_APPR_PROCESS_START", "Jour de la demande"),
+        ("SK_ID", "Identifiant "),
+    ]
+    label = c
+    for a, b in repl:
+        label = label.replace(a, b)
+    # Nettoyage
+    label = label.replace("__", " ").replace("_", " ").strip()
+    # Titrage
+    label = label.capitalize()
+    # Ajustements sémantiques
+    label = label.replace("Amt ", "Montant ")
+    label = label.replace("Cnt ", "Nombre ")
+    label = label.replace("Indicateur own car", "Possède une voiture")
+    label = label.replace("Indicateur own realty", "Possède un bien immobilier")
+    label = label.replace("Libellé education type", "Niveau d'éducation")
+    label = label.replace("Libellé income type", "Type de revenu")
+    label = label.replace("Libellé family status", "Situation familiale")
+    label = label.replace("Libellé housing type", "Type de logement")
+    label = label.replace("Score externe 1", "Score externe 1")
+    label = label.replace("Score externe 2", "Score externe 2")
+    label = label.replace("Score externe 3", "Score externe 3")
+    return label
 
 with main_tabs[5]:
     st.subheader("Dictionnaire des variables")
     if pool_df.empty:
         st.info("Données indisponibles.")
     else:
-        cols_present = list(pool_df.columns)
         rows = []
-        for c in cols_present:
+        for c in pool_df.columns:
             rows.append({
                 "Variable": c,
-                "Nom (FR)": FEATURE_LABELS.get(c, "—"),
-                "Description": FEATURE_DESCRIPTIONS.get(c, "—")
+                "Nom (FR)": french_label(c),
+                "Description": "—"  # à enrichir si besoin
             })
         dict_df = pd.DataFrame(rows)
         st.dataframe(dict_df.sort_values("Variable"), use_container_width=True)
 
 # -------------------------------
-# Tab 7 — Ratios (feature engineering)
+# Tab 7 — Ratios (feature engineering) avec calculs
 # -------------------------------
+def _safe_div(a, b):
+    try:
+        a = float(a)
+        b = float(b)
+        if b == 0 or pd.isna(a) or pd.isna(b):
+            return np.nan
+        return a / b
+    except Exception:
+        return np.nan
+
+def _to_years(days):
+    try:
+        return max(0.0, -float(days)) / 365.25
+    except Exception:
+        return np.nan
+
+def compute_ratios_for_row(row: pd.Series) -> pd.DataFrame:
+    # On tolère valeurs manquantes; on renvoie un tableau clair
+    vals = {}
+    g = lambda k: row.get(k, np.nan)
+
+    vals["PAYMENT_RATE"]        = _safe_div(g("AMT_ANNUITY"), g("AMT_CREDIT"))
+    vals["CREDIT_INCOME_RATIO"] = _safe_div(g("AMT_CREDIT"), g("AMT_INCOME_TOTAL"))
+    vals["ANNUITY_INCOME_RATIO"]= _safe_div(g("AMT_ANNUITY"), g("AMT_INCOME_TOTAL"))
+    vals["CREDIT_GOODS_RATIO"]  = _safe_div(g("AMT_CREDIT"), g("AMT_GOODS_PRICE"))
+
+    # Scores externes
+    s1, s2, s3 = g("EXT_SOURCE_1"), g("EXT_SOURCE_2"), g("EXT_SOURCE_3")
+    ext_list = [x for x in [s1, s2, s3] if pd.notna(x)]
+    vals["EXT_SOURCES_MEAN"] = (np.mean(ext_list) if ext_list else np.nan)
+    vals["EXT_SOURCES_SUM"]  = (np.sum(ext_list)  if ext_list else np.nan)
+    vals["EXT_SOURCES_NA"]   = 3 - len(ext_list)
+
+    # Âge et ancienneté
+    age_years   = g("AGE_YEARS")
+    if pd.isna(age_years) and "DAYS_BIRTH" in row.index:
+        age_years = _to_years(g("DAYS_BIRTH"))
+    employ_years = g("EMPLOY_YEARS")
+    if pd.isna(employ_years) and "DAYS_EMPLOYED" in row.index:
+        employ_years = _to_years(g("DAYS_EMPLOYED"))
+    vals["AGE_YEARS"]   = age_years
+    vals["EMPLOY_YEARS"]= employ_years
+    vals["EMPLOY_TO_AGE_RATIO"] = _safe_div(employ_years, age_years)
+
+    # Revenu par personne & ratio enfants
+    vals["INCOME_PER_PERSON"] = _safe_div(g("AMT_INCOME_TOTAL"), g("CNT_FAM_MEMBERS"))
+    vals["CHILDREN_RATIO"]    = _safe_div(g("CNT_CHILDREN"), g("CNT_FAM_MEMBERS"))
+
+    # DOC & MISSING s'ils existent
+    vals["DOC_COUNT"]         = g("DOC_COUNT") if "DOC_COUNT" in row.index else np.nan
+    vals["MISSING_COUNT_ROW"] = g("MISSING_COUNT_ROW") if "MISSING_COUNT_ROW" in row.index else np.nan
+
+    # Mise en forme
+    out = []
+    for k, v in vals.items():
+        out.append({
+            "Variable": k,
+            "Valeur": v,
+            "Interprétation": {
+                "PAYMENT_RATE": "Part de la mensualité dans le crédit (faible = moindre pression).",
+                "CREDIT_INCOME_RATIO": "Charge du crédit vs revenu.",
+                "ANNUITY_INCOME_RATIO": "Mensualité vs revenu.",
+                "CREDIT_GOODS_RATIO": "≈1 sans apport ; <1 avec apport.",
+                "EXT_SOURCES_MEAN": "Moyenne des scores externes.",
+                "EXT_SOURCES_SUM": "Somme des scores externes.",
+                "EXT_SOURCES_NA": "Nombre de scores externes manquants.",
+                "AGE_YEARS": "Âge en années.",
+                "EMPLOY_YEARS": "Ancienneté pro en années.",
+                "EMPLOY_TO_AGE_RATIO": "Part de la vie passée en emploi.",
+                "INCOME_PER_PERSON": "Revenu par personne.",
+                "CHILDREN_RATIO": "Charge enfants / ménage.",
+                "DOC_COUNT": "Nombre de documents fournis.",
+                "MISSING_COUNT_ROW": "Champs manquants dans le dossier.",
+            }.get(k, "—")
+        })
+    df = pd.DataFrame(out)
+    # Formatage lisible (valeurs petites en décimales, grosses avec espace)
+    def _fmt(v):
+        if pd.isna(v):
+            return "—"
+        try:
+            fv = float(v)
+        except Exception:
+            return str(v)
+        if abs(fv) >= 1000:
+            return fmt_num(fv, 0)
+        return fmt_num(fv, 4)
+    df["Valeur"] = df["Valeur"].map(_fmt)
+    return df
+
 with main_tabs[6]:
-    st.subheader("Ratios & variables dérivées (feature engineering)")
-    ratios = [
-        {
-            "Variable": "PAYMENT_RATE",
-            "Formule": "AMT_ANNUITY / AMT_CREDIT",
-            "Interprétation": "Part de la mensualité dans le crédit (faible = moindre pression)."
-        },
-        {
-            "Variable": "CREDIT_INCOME_RATIO",
-            "Formule": "AMT_CREDIT / AMT_INCOME_TOTAL",
-            "Interprétation": "Charge relative du crédit par rapport au revenu."
-        },
-        {
-            "Variable": "ANNUITY_INCOME_RATIO",
-            "Formule": "AMT_ANNUITY / AMT_INCOME_TOTAL",
-            "Interprétation": "Mensualité rapportée au revenu."
-        },
-        {
-            "Variable": "CREDIT_GOODS_RATIO",
-            "Formule": "AMT_CREDIT / AMT_GOODS_PRICE",
-            "Interprétation": "≈1 sans apport ; <1 avec apport ; >1 rares cas d'ajouts."
-        },
-        {
-            "Variable": "EXT_SOURCES_MEAN",
-            "Formule": "mean(EXT_SOURCE_1, EXT_SOURCE_2, EXT_SOURCE_3)",
-            "Interprétation": "Synthèse des scores externes (plus élevé = meilleur)."
-        },
-        {
-            "Variable": "EXT_SOURCES_SUM",
-            "Formule": "sum(EXT_SOURCE_1, EXT_SOURCE_2, EXT_SOURCE_3)",
-            "Interprétation": "Somme brute des signaux externes."
-        },
-        {
-            "Variable": "EXT_SOURCES_NA",
-            "Formule": "count_na(EXT_SOURCE_1..3)",
-            "Interprétation": "Nombre de scores externes manquants (plus = risque)."
-        },
-        {
-            "Variable": "AGE_YEARS",
-            "Formule": "-DAYS_BIRTH / 365.25",
-            "Interprétation": "Âge en années."
-        },
-        {
-            "Variable": "EMPLOY_YEARS",
-            "Formule": "max(0, -DAYS_EMPLOYED) / 365.25",
-            "Interprétation": "Ancienneté pro en années."
-        },
-        {
-            "Variable": "EMPLOY_TO_AGE_RATIO",
-            "Formule": "EMPLOY_YEARS / AGE_YEARS",
-            "Interprétation": "Part de la vie passée en emploi (stabilité)."
-        },
-        {
-            "Variable": "INCOME_PER_PERSON",
-            "Formule": "AMT_INCOME_TOTAL / CNT_FAM_MEMBERS",
-            "Interprétation": "Niveau de revenu par personne du foyer."
-        },
-        {
-            "Variable": "CHILDREN_RATIO",
-            "Formule": "CNT_CHILDREN / CNT_FAM_MEMBERS",
-            "Interprétation": "Charge liée aux enfants dans le foyer."
-        },
-        {
-            "Variable": "DOC_COUNT",
-            "Formule": "Somme des flags DOC_*",
-            "Interprétation": "Richesse du dossier documentaire."
-        },
-        {
-            "Variable": "MISSING_COUNT_ROW",
-            "Formule": "Nombre de champs NA par ligne",
-            "Interprétation": "Qualité de saisie / complétude du dossier."
-        },
-    ]
-    st.dataframe(pd.DataFrame(ratios), use_container_width=True)
+    st.subheader("Ratios & variables dérivées (calculs réels)")
+
+    colA, colB = st.columns(2)
+    with colA:
+        st.markdown("**Client sélectionné**")
+        if x_row.empty:
+            st.info("Sélectionnez un client dans la barre latérale.")
+        else:
+            df_rat_cli = compute_ratios_for_row(x_row.iloc[0])
+            st.dataframe(df_rat_cli, use_container_width=True)
+    with colB:
+        st.markdown("**Dernier “Nouveau client” saisi**")
+        if "last_new_client_row" not in st.session_state:
+            st.info("Aucun nouveau client saisi pour l’instant (utilisez l’onglet *Nouveau client*).")
+        else:
+            try:
+                df_newrow = st.session_state["last_new_client_row"]
+                df_rat_new = compute_ratios_for_row(df_newrow.iloc[0])
+                st.dataframe(df_rat_new, use_container_width=True)
+            except Exception as e:
+                st.warning(f"Impossible d'afficher les ratios du nouveau client : {e}")
 
 # -------------------------------
-# Tab 8 — Seuil & coût métier
+# Tab 8 — Seuil & coût métier (inchangé)
 # -------------------------------
 with main_tabs[7]:
     st.subheader("Seuil & coût métier (optimisation)")
