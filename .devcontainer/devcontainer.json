@@ -1,5 +1,8 @@
 {
   "name": "P7",
-  "build": { "dockerfile": "Dockerfile" },
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "."
+  },
   "forwardPorts": [8501, 8000]
 }
