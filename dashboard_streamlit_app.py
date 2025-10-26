@@ -572,7 +572,7 @@ with st.sidebar:
     if st.button("🔄 Forcer rechargement (vider cache)"):
         st.cache_data.clear()
         st.cache_resource.clear()
-        st.experimental_rerun()
+        st.rerun()
 
     # Mode de scoring
     st.subheader("Mode de scoring")
@@ -1224,7 +1224,7 @@ with main_tabs[6]:
                         if st.button("✅ Appliquer le seuil optimal au dashboard"):
                             st.session_state["threshold"] = float(best["threshold"])
                             st.success(f"Seuil mis à jour à {best['threshold']:.3f}.")
-                            st.experimental_rerun()
+                            st.rerun()
                     with apply_cols[1]:
                         st.caption("Le seuil optimal minimise le coût total attendu : `coût = FP × coût_FP + FN × coût_FN`.")
 
