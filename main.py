@@ -123,3 +123,9 @@ def predict(req: PredictRequest):
     except Exception as e:
         log(f"Predict error: {e}\n{traceback.format_exc()}")
         raise HTTPException(500, f"Prediction error: {e}")
+
+
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "P7 Credit API", "endpoints": ["/health", "/predict"]}
+
