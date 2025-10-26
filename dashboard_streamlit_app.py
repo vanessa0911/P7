@@ -16,7 +16,6 @@ from typing import List, Optional, Tuple, Dict, Any
 import numpy as np
 import pandas as pd
 import joblib
-import shap
 import plotly.graph_objects as go
 import streamlit as st
 import requests
