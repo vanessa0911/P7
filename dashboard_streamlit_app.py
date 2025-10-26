@@ -479,12 +479,7 @@ with main_tabs[0]:
 
     if proba is None:
         st.stop()
-
-    def _band(p: float):
-        if p < 0.05: return ("Faible", "#3CB371")
-        if p < 0.15: return ("Modérée", "#E6B800")
-        return ("Élevée", "#E74C3C")
-    band, color = _band(proba)
+    band, color = prob_to_band(float(proba), low=0.05, high=0.15)
 
     col1, col2 = st.columns([1, 2])
     with col1:
@@ -793,39 +788,40 @@ with main_tabs[5]:
                     new_p, shap_df2 = None, None
 
         if new_p is not None:
-    # Utilise le helper global défini plus haut
-    band2, color2 = prob_to_band(float(new_p), low=0.05, high=0.15)
-    decision = "Refus" if float(new_p) >= float(threshold) else "Accord"
+            # Utilise le helper global défini plus haut
+            band2, color2 = prob_to_band(float(new_p), low=0.05, high=0.15)
+            decision = "Refus" if float(new_p) >= float(threshold) else "Accord"
 
-    fign = go.Figure(go.Indicator(
-        mode="gauge+number",
-        value=float(new_p) * 100.0,
-        number={"suffix": "%"},
-        gauge={
-            "axis": {"range": [0, 100]},
-            "bar": {"color": color2},
-            # Ombres comme sur l'onglet "Score & explication" pour matérialiser le seuil
-            "steps": [
-                {"range": [0, float(threshold) * 100.0], "color": "#ecf8f3"},
-                {"range": [float(threshold) * 100.0, 100], "color": "#fdecea"},
-            ],
-        },
-        title={"text": f"Probabilité de défaut (nouveau client) — {mode.split()[0]}"},
-    ))
-    st.plotly_chart(fign, use_container_width=True)
+            fign = go.Figure(go.Indicator(
+                mode="gauge+number",
+                value=float(new_p) * 100.0,
+                number={"suffix": "%"},
+                gauge={
+                    "axis": {"range": [0, 100]},
+                    "bar": {"color": color2},
+                    # Ombres comme sur l'onglet "Score & explication" pour matérialiser le seuil
+                    "steps": [
+                        {"range": [0, float(threshold) * 100.0], "color": "#ecf8f3"},
+                        {"range": [float(threshold) * 100.0, 100], "color": "#fdecea"},
+                    ],
+                },
+                title={"text": f"Probabilité de défaut (nouveau client) — {mode.split()[0]}"},
+            ))
+            st.plotly_chart(fign, use_container_width=True)
 
-    # ➕ Ajouts : décision & rappel du seuil
-    st.markdown(f"**Décision (seuil {float(threshold):.3f})** : **{decision}**")
-    st.markdown(f"Niveau de risque : **{band2}**")
+            # ➕ Ajouts : décision & rappel du seuil
+            st.markdown(f"**Décision (seuil {float(threshold):.3f})** : **{decision}**")
+            st.markdown(f"Niveau de risque : **{band2}**")
 
-    # SHAP (inchangé)
-    if shap_df2 is not None and not shap_df2.empty:
-        tmp = shap_df2.copy().sort_values("abs_val").tail(10)
-        x_vals = np.asarray(tmp["shap_value"].values, dtype=float)
-        y_vals = tmp["feature"].astype(str).tolist()
-        figb2 = go.Figure(go.Bar(x=x_vals, y=y_vals, orientation="h"))
-        figb2.update_layout(title="Contributions locales (SHAP) — top 10")
-        st.plotly_chart(figb2, use_container_width=True)
+            # SHAP (inchangé)
+            if shap_df2 is not None and not shap_df2.empty:
+                tmp = shap_df2.copy().sort_values("abs_val").tail(10)
+                x_vals = np.asarray(tmp["shap_value"].values, dtype=float)
+                y_vals = tmp["feature"].astype(str).tolist()
+                figb2 = go.Figure(go.Bar(x=x_vals, y=y_vals, orientation="h"))
+                figb2.update_layout(title="Contributions locales (SHAP) — top 10")
+                st.plotly_chart(figb2, use_container_width=True)
+
 
 
 # -------------------------------
