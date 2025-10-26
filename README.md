@@ -15,3 +15,4 @@ python -m streamlit run dashboard_streamlit_app.py --server.address 0.0.0.0 --se
 API base URL 
 https://p7-credit-api.onrender.com
 
+https://p7-tentative2.onrender.com
