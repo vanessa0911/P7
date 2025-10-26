@@ -1,0 +1,9 @@
+fastapi>=0.110,<1
+uvicorn[standard]>=0.30,<0.31
+pydantic>=2.7,<3
+joblib>=1.3,<2
+numpy==1.26.4
+pandas==2.2.2
+scikit-learn==1.4.2
+# shap est optionnel, on le laisse en commentaire pour éviter des builds lentes
+# shap==0.44.1
