@@ -40,7 +40,8 @@ except Exception:
     REPORTLAB_AVAILABLE = False
 
 st.set_page_config(page_title="Prêt à dépenser — Credit Scoring", page_icon="💳", layout="wide")
-
+st.title("💳 Prêt à dépenser — Credit Scoring")
+st.caption("Transparence & explicabilité des décisions d’octroi")
 # -------------------------------
 # Runtime diagnostics
 # -------------------------------
@@ -342,12 +343,9 @@ GLOBIMP    = _pick_first_existing(["global_importance.csv"])
 INTERP_SUM = _pick_first_existing(["interpretability_summary.json"])
 
 with st.sidebar:
-    st.title("💳 Scoring Crédit — Dashboard")
-    st.caption("Prêt à dépenser — transparence & explicabilité")
 
     # Diagnostics
     path, mtime_str, sha8, git = _runtime_info()
-    st.caption(f"App version: {APP_VERSION}")
     st.caption(f"Fichier: {os.path.basename(path)}")
     st.caption(f"Dernière modif: {mtime_str}")
     st.caption(f"SHA fichier: {sha8} | Git: {git}")
@@ -386,9 +384,11 @@ TARGET_COL = "TARGET" if (not pool_df.empty and "TARGET" in pool_df.columns) els
 # Sidebar: paramètres + client
 with st.sidebar:
     st.subheader("Paramètres du modèle / seuil")
-    default_thresh = st.session_state.get("threshold", 0.08)
-    threshold = st.slider("Seuil d'acceptation (proba défaut)", 0.0, 0.5, float(default_thresh), 0.005, key="threshold",
-                          help="Au-delà du seuil = risque élevé ⇒ refus")
+    default_thresh = float(np.clip(st.session_state.get("threshold", 0.67), 0.0, 1.0))
+    threshold = st.slider(
+        "Seuil d'acceptation (proba défaut)",
+        0.0, 1.0, float(default_thresh), 0.001, key="threshold",
+        help="Au-delà du seuil = risque élevé ⇒ refus")
 
     st.subheader("Sélection du client")
     id_options = pool_df[ID_COL].tolist() if (ID_COL and not pool_df.empty) else []
