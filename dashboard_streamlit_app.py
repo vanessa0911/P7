@@ -1,9 +1,9 @@
-# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v1.5.0)
+# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v1.2.1)
 # ----------------------------------------------------------------
 # Run:
 #   python -m streamlit run dashboard_streamlit_app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true
 
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.2.1"
 
 import os
 import json
@@ -38,12 +38,15 @@ try:
 except Exception:
     REPORTLAB_AVAILABLE = False
 
+# -------------------------------
+# Page config & header
+# -------------------------------
 st.set_page_config(page_title="Prêt à dépenser — Credit Scoring", page_icon="💳", layout="wide")
 st.title("💳 Prêt à dépenser — Credit Scoring")
 st.caption("Transparence & explicabilité des décisions d’octroi")
 
 # -------------------------------
-# Runtime diagnostics
+# Utils
 # -------------------------------
 def _runtime_info():
     try:
@@ -66,29 +69,22 @@ def _runtime_info():
         git = "n/a"
     return path, mtime_str, sha, git
 
-# -------------------------------
-# Helpers
-# -------------------------------
+def fmt_int(x: Any) -> str:
+    """Format entier / float en style FR (milliers = espace, décimale = virgule)."""
+    try:
+        v = float(x)
+    except Exception:
+        return str(x)
+    if abs(v - int(v)) < 1e-9:
+        return f"{int(v):,}".replace(",", " ").replace(".", ",")
+    # 2 décimales si non entier
+    return f"{v:,.2f}".replace(",", " ").replace(".", ",")
+
 def _pick_first_existing(paths: List[str]) -> Optional[str]:
     for p in paths:
         if p and os.path.exists(p):
             return p
     return None
-
-def fmt_int(n: Any) -> str:
-    try:
-        return f"{int(n):,}".replace(",", " ")
-    except Exception:
-        return str(n)
-
-def fmt_num(x, decimals=2) -> str:
-    try:
-        if pd.isna(x):
-            return "—"
-        s = f"{float(x):,.{decimals}f}"
-        return s.replace(",", " ").replace(".", ",")
-    except Exception:
-        return str(x)
 
 @st.cache_data(show_spinner=False)
 def load_table(path: str) -> pd.DataFrame:
@@ -151,81 +147,32 @@ def get_expected_input_columns(model) -> Optional[List[str]]:
         pass
     return None
 
-# ---------- SHAP local (robuste) ----------
 def compute_local_shap(estimator, X_background: pd.DataFrame, x_row: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     """
-    1) Tentative standard (masker Independent) sur TOUTES colonnes
-    2) Fallback robuste : SHAP Permutation **uniquement sur les colonnes numériques**,
-       en gardant les features non-numériques fixes (valeurs du client).
-       Retourne un vecteur de contributions aligné sur X_background.columns
-       (0 pour les colonnes non-numériques si fallback).
+    Explainer SHAP générique basé sur shap.Explainer + Independent masker.
+    Conserve les types d'origine (le Pipeline gère le prétraitement).
     """
-    import shap
-
-    bg = X_background.copy()
+    import shap, pandas as pd, numpy as np
+    bg = X_background
     if len(bg) > 200:
         bg = bg.sample(200, random_state=42)
 
-    expected_cols = list(bg.columns)
-
-    def f_full(Xdf):
-        import pandas as pd
+    # fonction modèle : accepte DataFrame, renvoie proba défaut
+    def f(Xdf):
         if not isinstance(Xdf, pd.DataFrame):
-            Xdf = pd.DataFrame(Xdf, columns=expected_cols)
-        else:
-            Xdf = Xdf.reindex(columns=expected_cols)
+            Xdf = pd.DataFrame(Xdf, columns=list(bg.columns))
+        # Important : aligner les colonnes (ordre + manquantes)
+        for c in bg.columns:
+            if c not in Xdf.columns:
+                Xdf[c] = np.nan
+        Xdf = Xdf[bg.columns]
         return estimator.predict_proba(Xdf)[:, 1]
 
-    # 1) essai standard
-    try:
-        masker = shap.maskers.Independent(bg)
-        ex = shap.Explainer(f_full, masker, feature_names=expected_cols)(x_row.reindex(columns=expected_cols))
-        vals = np.array(ex.values).reshape(-1)
-        base = np.array(ex.base_values).reshape(-1)
-        return vals, base
-    except Exception:
-        pass
+    masker = shap.maskers.Independent(bg)
+    explainer = shap.Explainer(f, masker, feature_names=list(bg.columns))
+    ex = explainer(x_row)
+    return np.array(ex.values).reshape(-1), np.array(ex.base_values).reshape(-1)
 
-    # 2) fallback numérique-only (catégorielles fixées)
-    num_cols = [c for c in expected_cols if pd.api.types.is_numeric_dtype(bg[c])]
-    if not num_cols:
-        raise RuntimeError("Aucune colonne numérique disponible pour SHAP fallback.")
-
-    # Prépare fond et instance numériques (remplissage NaN pour stabilité)
-    bg_num = pd.DataFrame({c: pd.to_numeric(bg[c], errors="coerce") for c in num_cols})
-    medians = bg_num.median(numeric_only=True)
-    bg_num = bg_num.fillna(medians)
-
-    x_fixed = x_row.reindex(columns=expected_cols).iloc[0].copy()
-    x_num = pd.DataFrame({c: pd.to_numeric([x_fixed[c]], errors="coerce") for c in num_cols}).fillna(medians).iloc[[0]]
-
-    def f_num(Xnum):
-        import pandas as pd
-        # Xnum → DataFrame numeric avec les bonnes colonnes
-        if not isinstance(Xnum, pd.DataFrame):
-            Xnum = pd.DataFrame(Xnum, columns=num_cols)
-        else:
-            Xnum = Xnum.reindex(columns=num_cols)
-        # reconstruit le DF complet en gardant non-numériques fixes
-        full = pd.DataFrame([x_fixed] * len(Xnum), columns=expected_cols)
-        for c in num_cols:
-            full[c] = Xnum[c].values
-        return estimator.predict_proba(full)[:, 1]
-
-    try:
-        ex = shap.explainers.Permutation(f_num, bg_num)(x_num)
-        vals_num = np.array(ex.values).reshape(-1)    # taille = len(num_cols)
-        base = np.array(ex.base_values).reshape(-1)
-        # Remplit un vecteur aligné sur expected_cols (0 pour non-numériques)
-        vals_full = np.zeros(len(expected_cols), dtype=float)
-        col_pos = {c: i for i, c in enumerate(expected_cols)}
-        for i, c in enumerate(num_cols):
-            vals_full[col_pos[c]] = vals_num[i]
-        return vals_full, base
-    except Exception as e2:
-        raise RuntimeError(f"SHAP indisponible même en fallback numérique: {e2}")
-
-# ---------- Utils quantiles / cohortes ----------
 def get_quantile_series(feature: str, pool_df: pd.DataFrame, X: pd.DataFrame) -> Optional[pd.Series]:
     if feature in pool_df.columns and pd.api.types.is_numeric_dtype(pool_df[feature]):
         return pool_df[feature]
@@ -276,9 +223,7 @@ def cost_curve(y_true: np.ndarray, p: np.ndarray, cost_fp: float, cost_fn: float
     best = df.iloc[best_pos].to_dict()
     return df, best
 
-# -------------------------------
 # API helpers
-# -------------------------------
 def api_health(base_url: str) -> tuple[bool, str]:
     try:
         r = requests.get(base_url.rstrip("/") + "/health", timeout=4)
@@ -298,9 +243,7 @@ def api_metrics(base_url: str, payload: dict) -> dict:
     r.raise_for_status()
     return r.json()
 
-# -------------------------------
-# PDF builders
-# -------------------------------
+# ---- PDF builder ----
 def build_client_report_pdf(
     client_id: str,
     model_name: str,
@@ -340,6 +283,7 @@ def build_client_report_pdf(
         ]
     else:
         tbl = [["Probabilité de défaut", "—"], ["Seuil", f"{threshold:.3f}"], ["Décision", "—"], ["Niveau de risque", "—"]]
+    from reportlab.platypus import Table, TableStyle
     t = Table(tbl, hAlign="LEFT", colWidths=[7*cm, 7*cm])
     t.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
@@ -352,6 +296,7 @@ def build_client_report_pdf(
     story.append(Spacer(1, 8))
 
     story.append(Paragraph("Contributions locales (top 10)", styles["H2"]))
+    from reportlab.platypus import Table
     if shap_vals is not None and not shap_vals.empty:
         dfc = shap_vals.sort_values("abs_val", ascending=False).head(10).copy()
         dfc["effet"] = dfc["shap_value"].apply(lambda v: "↑ risque" if v > 0 else ("↓ risque" if v < 0 else "neutre"))
@@ -364,6 +309,7 @@ def build_client_report_pdf(
         t2 = Table(data, hAlign="LEFT", colWidths=[10*cm, 4*cm])
     else:
         t2 = Table([["Information", "Détail"], ["Explicabilité", "Indisponible"]], hAlign="LEFT", colWidths=[10*cm, 4*cm])
+    from reportlab.platypus import TableStyle
     t2.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
         ("BOX", (0,0), (-1,-1), 0.25, colors.black),
@@ -375,7 +321,7 @@ def build_client_report_pdf(
     story.append(t2)
     story.append(Spacer(1, 8))
 
-    story.append(Paragraph("Variables clés", styles["H2"]))
+    story.append(Paragraph("Variables clés", styles["H2"]]))
     if global_imp_df is not None and not global_imp_df.empty:
         keys = [f for f in global_imp_df["feature"].tolist() if f in X.columns][:20]
     else:
@@ -385,7 +331,9 @@ def build_client_report_pdf(
     for f in keys:
         v = row[f] if f in row.index else np.nan
         kv.append([str(f), "" if pd.isna(v) else str(v)])
+    from reportlab.platypus import Table
     t3 = Table(kv, hAlign="LEFT", colWidths=[9*cm, 5*cm])
+    from reportlab.platypus import TableStyle
     t3.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
         ("BOX", (0,0), (-1,-1), 0.25, colors.black),
@@ -410,6 +358,13 @@ def suggest_actions(
     top_n:int = 5,
     global_imp_df: Optional[pd.DataFrame] = None,
 ) -> tuple[list[dict], list[dict]]:
+    """
+    Retourne (axes_amelioration, points_forts).
+    - Cas 1: SHAP dispo -> s'appuie sur shap_df (positif = ↑ risque, négatif = ↓ risque)
+    - Cas 2: SHAP indispo -> fallback basé sur importance globale + position vs médiane,
+             avec filet de sécurité pour proposer quelques axes.
+    Chaque item = {"feature": str, "value": any, "note": str}
+    """
     def _quantiles_for(f: str):
         s = None
         if f in pool_df.columns and pd.api.types.is_numeric_dtype(pool_df[f]):
@@ -454,20 +409,25 @@ def suggest_actions(
             pos_txt = "au-dessus" if v >= q["p50"] else "en-dessous"
             return f"Point fort : valeur {pos_txt} de la médiane ({q['p50']:.2f})."
 
+    # ===== Cas 1: SHAP disponible =====
     if shap_df is not None and not shap_df.empty and not new_x.empty:
         tmp = shap_df.copy().sort_values("abs_val", ascending=False)
-        pos = tmp[tmp["shap_value"] > 0].head(top_n)
-        neg = tmp[tmp["shap_value"] < 0].head(top_n)
+        pos = tmp[tmp["shap_value"] > 0].head(top_n)   # ↑ risque
+        neg = tmp[tmp["shap_value"] < 0].head(top_n)   # ↓ risque
         axes, strong = [], []
         row = new_x.iloc[0]
+
         for _, r in pos.iterrows():
             f = str(r["feature"]); v = row[f] if f in row.index else np.nan; q = _quantiles_for(f)
-            axes.append({"feature": f, "value": v, "note": _mk_note(f, v, True,  q)})
+            axes.append({"feature": f, "value": v, "note": _mk_note(f, v, shap_pos=True,  q=q)})
+
         for _, r in neg.iterrows():
             f = str(r["feature"]); v = row[f] if f in row.index else np.nan; q = _quantiles_for(f)
-            strong.append({"feature": f, "value": v, "note": _mk_note(f, v, False, q)})
+            strong.append({"feature": f, "value": v, "note": _mk_note(f, v, shap_pos=False, q=q)})
+
         return axes, strong
 
+    # ===== Cas 2: Fallback sans SHAP =====
     axes, strong = [], []
     if global_imp_df is None or global_imp_df.empty or new_x.empty:
         return axes, strong
@@ -483,54 +443,154 @@ def suggest_actions(
 
     scored = []
     for f in cand:
-        s = None
-        if f in pool_df.columns and pd.api.types.is_numeric_dtype(pool_df[f]):
-            s = pool_df[f]
-        elif f in X.columns and pd.api.types.is_numeric_dtype(X[f]):
-            s = X[f]
-        if s is None or s.dropna().empty:
+        q = _quantiles_for(f)
+        if q is None:
             continue
-        q = s.quantile([0.1, 0.5, 0.9])
-        qd = {"p10": float(q.loc[0.1]), "p50": float(q.loc[0.5]), "p90": float(q.loc[0.9])}
         v = row[f] if f in row.index else np.nan
         try:
             v_float = float(v)
         except Exception:
             continue
-        spread = max(qd["p90"] - qd["p10"], 1e-9)
-        deviation = abs(v_float - qd["p50"]) / spread
+        spread = max(q["p90"] - q["p10"], 1e-9)
+        deviation = abs(v_float - q["p50"]) / spread
         if f in HIGH_IS_RISK:
-            shap_pos_guess = (v_float > qd["p50"])
+            shap_pos_guess = (v_float > q["p50"])
         elif f in LOW_IS_RISK:
-            shap_pos_guess = (v_float < qd["p50"])
+            shap_pos_guess = (v_float < q["p50"])
         else:
-            shap_pos_guess = (v_float > qd["p90"] or v_float < qd["p10"])
-        scored.append((f, v, qd, deviation, shap_pos_guess))
+            shap_pos_guess = (v_float > q["p90"] or v_float < q["p10"])
+        scored.append((f, v, q, deviation, shap_pos_guess))
 
     scored.sort(key=lambda t: t[3], reverse=True)
-    for f, v, qd, _, shap_pos_guess in scored[:top_n]:
+
+    for f, v, q, _, shap_pos_guess in scored[:top_n]:
         if shap_pos_guess:
-            axes.append({"feature": f, "value": v, "note": _mk_note(f, v, True,  qd)})
+            axes.append({"feature": f, "value": v, "note": _mk_note(f, v, True,  q)})
         else:
-            strong.append({"feature": f, "value": v, "note": _mk_note(f, v, False, qd)})
+            strong.append({"feature": f, "value": v, "note": _mk_note(f, v, False, q)})
 
     if not axes:
         forced = []
-        for f, v, qd, _, _ in scored:
+        for f, v, q, _, _ in scored:
             try:
-                vf = float(v)
+                v_float = float(v)
             except Exception:
                 continue
-            if (f in HIGH_IS_RISK and vf >= qd["p50"]) or (f in LOW_IS_RISK and vf <= qd["p50"]):
-                forced.append({"feature": f, "value": v, "note": _mk_note(f, v, True, qd)})
+            if (f in HIGH_IS_RISK and v_float >= q["p50"]) or (f in LOW_IS_RISK and v_float <= q["p50"]):
+                forced.append({"feature": f, "value": v, "note": _mk_note(f, v, True, q)})
                 if len(forced) >= min(3, top_n):
                     break
         if not forced:
-            for f, v, qd, _, _ in scored[:min(3, top_n)]:
-                forced.append({"feature": f, "value": v, "note": _mk_note(f, v, True, qd)})
+            for f, v, q, _, _ in scored[:min(3, top_n)]:
+                forced.append({"feature": f, "value": v, "note": _mk_note(f, v, True, q)})
         axes = forced
 
     return axes, strong
+
+
+def build_new_client_report_pdf(
+    proba: Optional[float],
+    threshold: float,
+    decision: str,
+    band_label: str,
+    new_x: pd.DataFrame,
+    X: pd.DataFrame,
+    pool_df: pd.DataFrame,
+    global_imp_df: Optional[pd.DataFrame],
+    shap_df: Optional[pd.DataFrame],
+) -> bytes:
+    """PDF dédié 'Nouveau client' + message de remerciement + axes d'amélioration."""
+    if not REPORTLAB_AVAILABLE:
+        return b""
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.units import cm
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=1.5*cm, rightMargin=1.5*cm, topMargin=1.2*cm, bottomMargin=1.2*cm)
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="TitleBig", fontSize=18, leading=22, spaceAfter=12, alignment=1))
+    styles.add(ParagraphStyle(name="H2", fontSize=13, leading=16, spaceBefore=10, spaceAfter=6))
+    styles.add(ParagraphStyle(name="Small", fontSize=9, leading=12, textColor="#555555"))
+
+    story = []
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    story.append(Paragraph("Prêt à dépenser — Résultats (Nouveau client)", styles["TitleBig"]))
+    story.append(Paragraph(f"Date: {now} • App: {APP_VERSION}", styles["Small"]))
+    story.append(Spacer(1, 8))
+
+    story.append(Paragraph(
+        "Merci pour votre confiance. Voici vos résultats actuels et, en cas de refus, des axes d’amélioration possibles.",
+        styles["Small"]
+    ))
+    story.append(Spacer(1, 6))
+
+    story.append(Paragraph("Score & décision", styles["H2"]))
+    if proba is not None:
+        tbl = [
+            ["Probabilité de défaut", f"{proba*100:.2f} %"],
+            ["Seuil (proba défaut)", f"{threshold:.3f}"],
+            ["Décision", decision],
+            ["Niveau de risque", band_label],
+        ]
+    else:
+        tbl = [["Probabilité de défaut", "—"], ["Seuil", f"{threshold:.3f}"], ["Décision", "—"], ["Niveau de risque", "—"]]
+    t = Table(tbl, hAlign="LEFT", colWidths=[7*cm, 7*cm])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
+        ("BOX", (0,0), (-1,-1), 0.25, colors.black),
+        ("INNERGRID", (0,0), (-1,-1), 0.25, colors.grey),
+        ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
+        ("FONTSIZE", (0,0), (-1,-1), 10),
+    ]))
+    story.append(t)
+    story.append(Spacer(1, 8))
+
+    axes, strong = suggest_actions(shap_df, new_x, X, pool_df, top_n=5, global_imp_df=global_imp_df)
+    story.append(Paragraph("Axes d’amélioration (si décision = Refus)", styles["H2"]))
+    if axes:
+        data = [["Variable", "Valeur", "Recommandation"]]
+        for a in axes:
+            data.append([str(a["feature"]), "" if pd.isna(a["value"]) else str(a["value"]), a["note"]])
+        t2 = Table(data, hAlign="LEFT", colWidths=[5.5*cm, 3.0*cm, 5.5*cm])
+    else:
+        t2 = Table([["Information", "Détail"], ["Recommandations", "Aucune recommandation spécifique (explicabilité locale indisponible)."]],
+                   hAlign="LEFT", colWidths=[7*cm, 7*cm])
+    t2.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
+        ("BOX", (0,0), (-1,-1), 0.25, colors.black),
+        ("INNERGRID", (0,0), (-1,-1), 0.25, colors.grey),
+        ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
+        ("FONTSIZE", (0,0), (-1,-1), 9),
+    ]))
+    story.append(t2)
+    story.append(Spacer(1, 8))
+
+    story.append(Paragraph("Points forts du dossier", styles["H2"]))
+    if strong:
+        data = [["Variable", "Valeur", "Commentaire"]]
+        for s in strong:
+            data.append([str(s["feature"]), "" if pd.isna(s["value"]) else str(s["value"]), s["note"]])
+        t3 = Table(data, hAlign="LEFT", colWidths=[5.5*cm, 3.0*cm, 5.5*cm])
+    else:
+        t3 = Table([["Information", "Détail"], ["Points forts", "Non disponibles (explicabilité locale indisponible)."]],
+                   hAlign="LEFT", colWidths=[7*cm, 7*cm])
+    t3.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
+        ("BOX", (0,0), (-1,-1), 0.25, colors.black),
+        ("INNERGRID", (0,0), (-1,-1), 0.25, colors.grey),
+        ("ALIGN", (2,1), (2,-1), "RIGHT"),
+        ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
+        ("FONTSIZE", (0,0), (-1,-1), 9),
+    ]))
+    story.append(t3)
+
+    doc.build(story)
+    pdf_bytes = buf.getvalue()
+    buf.close()
+    return pdf_bytes
 
 # -------------------------------
 # Locate artifacts at repo root
@@ -549,6 +609,7 @@ GLOBIMP    = _pick_first_existing(["global_importance.csv"])
 INTERP_SUM = _pick_first_existing(["interpretability_summary.json"])
 
 with st.sidebar:
+    # Diagnostics
     path, mtime_str, sha8, git = _runtime_info()
     st.caption(f"Fichier: {os.path.basename(path)}")
     st.caption(f"Dernière modif: {mtime_str}")
@@ -559,6 +620,7 @@ with st.sidebar:
         st.cache_resource.clear()
         st.rerun()
 
+    # Mode de scoring
     st.subheader("Mode de scoring")
     mode = st.radio("Choisir le mode", ["Local (modèle embarqué)", "API FastAPI"], index=0)
     api_base = None
@@ -620,8 +682,6 @@ if not pool_df.empty and selected_id is not None:
         if c not in df_idx.columns:
             df_idx[c] = np.nan
     X = df_idx[expected_cols_local]
-    if selected_id not in X.index:
-        st.stop()
     x_row = X.loc[[selected_id]]
     background = X.sample(min(200, len(X)), random_state=42)
 else:
@@ -630,7 +690,7 @@ else:
     background = X
 
 # -------------------------------
-# Tabs
+# Tabs (insights globaux supprimé)
 # -------------------------------
 TABS = [
     "📈 Score & explication",
@@ -638,8 +698,6 @@ TABS = [
     "⚖️ Comparaison",
     "🧪 Qualité des données",
     "🆕 Nouveau client",
-    "📚 Dictionnaire des variables",
-    "⚙️ Ratios (feature engineering)",
     "💰 Seuil & coût métier",
 ]
 main_tabs = st.tabs(TABS)
@@ -675,7 +733,7 @@ with main_tabs[0]:
                     shap_df = pd.DataFrame(rows)
             except Exception as e:
                 st.warning(f"API KO ({e}). Bascule en Local si possible.")
-                if model_local is None or x_row.empty:
+                if model_local is None:
                     st.stop()
                 proba = float(model_local.predict_proba(x_row)[0, 1])
     else:
@@ -709,15 +767,14 @@ with main_tabs[0]:
 
     with col2:
         st.markdown("**Contributions locales (Top 10)**")
-
         def _bar_from_df(df: pd.DataFrame, title: str) -> go.Figure:
-            tmp = df.copy().sort_values("abs_val").tail(10)
+            tmp = df.copy()
+            tmp = tmp.sort_values("abs_val").tail(10)
             x_vals = np.asarray(tmp["shap_value"].values, dtype=float)
             y_vals = tmp["feature"].astype(str).tolist()
             hover = [f"valeur: {v}" for v in tmp["value"]]
             figb = go.Figure(go.Bar(x=x_vals, y=y_vals, orientation="h", hovertext=hover, hoverinfo="text+x+y"))
-            figb.update_layout(title=title)
-            figb.add_vline(x=0, line_width=1, line_dash="dash", line_color="black")
+            figb.update_layout(title=title, separators=", ")
             return figb
 
         if mode == "API FastAPI" and shap_df is not None and not shap_df.empty:
@@ -735,25 +792,15 @@ with main_tabs[0]:
                     }).sort_values("abs_val", ascending=False)
                     st.plotly_chart(_bar_from_df(shap_df_local, "Impact sur le score (positif = ↑ risque)"),
                                     use_container_width=True)
-                except Exception:
-                    # On n’affiche plus l’erreur ; on bascule proprement
-                    if global_imp_df is not None and not global_imp_df.empty:
-                        st.info("Explicabilité locale indisponible. Affichage de l'importance globale.")
-                        tmp = global_imp_df.head(10).copy()
-                        x_vals = np.asarray(tmp["importance"].values, dtype=float)
-                        y_vals = tmp["feature"].astype(str).tolist()
-                        figb = go.Figure(go.Bar(x=x_vals, y=y_vals, orientation="h"))
-                        figb.update_layout(title="Top 10 — Importance globale")
-                        st.plotly_chart(figb, use_container_width=True)
-                    else:
-                        st.info("Importance globale indisponible.")
+                except Exception as e:
+                    st.warning(f"SHAP local indisponible: {e}")
             else:
                 if global_imp_df is not None and not global_imp_df.empty:
                     tmp = global_imp_df.head(10).copy()
                     x_vals = np.asarray(tmp["importance"].values, dtype=float)
                     y_vals = tmp["feature"].astype(str).tolist()
                     figb = go.Figure(go.Bar(x=x_vals, y=y_vals, orientation="h"))
-                    figb.update_layout(title="Top 10 — Importance globale")
+                    figb.update_layout(title="Top 10 — Importance globale", separators=", ")
                     st.plotly_chart(figb, use_container_width=True)
                 else:
                     st.info("Importance globale indisponible.")
@@ -813,37 +860,43 @@ with main_tabs[2]:
         ] if c in pool_df.columns]
         default_coh = [c for c in candidate_cohorts[:2]]
         selected_cohorts = st.multiselect("Filtrer par attributs (cohorte similaire)", candidate_cohorts, default=default_coh)
-
         cohort_df = pool_df.copy()
         for c in selected_cohorts:
             try:
                 cohort_df = cohort_df[cohort_df[c] == pool_df.loc[pool_df[ID_COL] == selected_id, c].iloc[0]]
             except Exception:
                 pass
-
-        st.caption(f"Taille de la cohorte similaire : **{fmt_int(len(cohort_df))}**")
+        st.caption(f"Taille de la cohorte similaire : **{len(cohort_df):,}**".replace(",", " "))
 
         if global_imp_df is not None and not global_imp_df.empty:
-            cand = [f for f in global_imp_df["feature"].tolist() if f in pool_df.columns]
+            cand = [f for f in global_imp_df["feature"].tolist() if (f in X.columns or f in pool_df.columns)]
         else:
-            cand = [f for f in pool_df.columns]
-        num_feats = [f for f in cand if pd.api.types.is_numeric_dtype(pool_df[f])][:8]
+            cand = [f for f in list(X.columns) if (f in X.columns or f in pool_df.columns)]
 
-        if not num_feats:
+        comp_feats = []
+        for f in cand:
+            if get_quantile_series(f, pool_df, X) is not None:
+                comp_feats.append(f)
+            if len(comp_feats) >= 8:
+                break
+
+        if not comp_feats:
             st.info("Aucune variable numérique comparable disponible.")
         else:
             long_rows = []
-            for f in num_feats:
-                s_pop = pd.to_numeric(pool_df[f], errors="coerce")
-                if s_pop.dropna().empty:
+            for f in comp_feats:
+                s_pop = get_quantile_series(f, pool_df, X)
+                if s_pop is None or s_pop.dropna().empty:
                     continue
-                s_coh = pd.to_numeric(cohort_df[f], errors="coerce") if f in cohort_df.columns else pd.Series(dtype=float)
-                try:
-                    client_val = float(X.at[selected_id, f]) if f in X.columns and pd.notnull(X.at[selected_id, f]) else np.nan
-                except Exception:
-                    client_val = np.nan
+                s_coh = get_cohort_series(f, cohort_df, X, ID_COL)
+                client_val = float(x_row[f].iloc[0]) if f in X.columns and pd.notnull(x_row[f].iloc[0]) else np.nan
+
                 pop_q = s_pop.quantile([0.1, 0.5, 0.9]).values
-                coh_q = s_coh.quantile([0.1, 0.5, 0.9]).values if not s_coh.dropna().empty else [np.nan, np.nan, np.nan]
+                if s_coh is not None and not s_coh.dropna().empty:
+                    coh_q = s_coh.quantile([0.1, 0.5, 0.9]).values
+                else:
+                    coh_q = [np.nan, np.nan, np.nan]
+
                 long_rows += [
                     {"feature": f, "group": "Population", "p10": pop_q[0], "p50": pop_q[1], "p90": pop_q[2], "client": client_val},
                     {"feature": f, "group": "Cohorte similaire", "p10": coh_q[0], "p50": coh_q[1], "p90": coh_q[2], "client": client_val},
@@ -862,17 +915,16 @@ with main_tabs[2]:
                     y_feat = sub["feature"].astype(str).tolist()
 
                     figc = go.Figure()
-                    figc.add_trace(go.Scatter(x=x_p10, y=y_feat, mode="markers", name="P10",
-                                              hovertemplate="Variable: %{y}<br>P10: %{x:.2f}<extra></extra>"))
-                    figc.add_trace(go.Scatter(x=x_p50, y=y_feat, mode="markers", name="P50",
-                                              hovertemplate="Variable: %{y}<br>P50: %{x:.2f}<extra></extra>"))
-                    figc.add_trace(go.Scatter(x=x_p90, y=y_feat, mode="markers", name="P90",
-                                              hovertemplate="Variable: %{y}<br>P90: %{x:.2f}<extra></extra>"))
+                    figc.add_trace(go.Scatter(x=x_p10, y=y_feat, mode="markers", name="P10"))
+                    figc.add_trace(go.Scatter(x=x_p50, y=y_feat, mode="markers", name="P50"))
+                    figc.add_trace(go.Scatter(x=x_p90, y=y_feat, mode="markers", name="P90"))
                     figc.add_trace(go.Scatter(x=x_cli, y=y_feat, mode="markers", name="Client",
-                                              marker=dict(symbol="diamond", size=12),
-                                              hovertemplate="Variable: %{y}<br>Client: %{x:.2f}<extra></extra>"))
-                    figc.update_layout(title=f"{grp} — Positionnement du client (P10/P50/P90)",
-                                       height=420, separators=", ")
+                                              marker=dict(symbol="diamond", size=12)))
+                    figc.update_layout(
+                        title=f"{grp} — Positionnement du client (P10/P50/P90)",
+                        height=400,
+                        separators=", "  # décimale=',' ; milliers=' '
+                    )
                     st.plotly_chart(figc, use_container_width=True)
 
 # -------------------------------
@@ -881,38 +933,58 @@ with main_tabs[2]:
 with main_tabs[3]:
     st.subheader("Qualité des données & valeurs manquantes")
 
+    # Image (si fournie)
     miss_fig = _pick_first_existing(["__results___5_1.png", "missing_train.png"])
     if miss_fig:
-        st.image(miss_fig, caption="Top taux de valeurs manquantes (train)")
+        st.image(miss_fig, caption="Top taux de valeurs manquantes (train)", use_container_width=True)
     else:
         st.info("Figure de valeurs manquantes non trouvée.")
 
     st.markdown("### Distribution du **nombre de champs manquants par dossier**")
     if not pool_df.empty:
-        # Utilise la colonne fournie si dispo, sinon calcule à la volée
+        # Aligner la population sur les colonnes d'entrée du modèle (X.columns), en ajoutant les colonnes manquantes
+        try:
+            aligned_all = pool_df.set_index(ID_COL).reindex(columns=X.columns)
+        except Exception:
+            # fallback : si jamais set_index rate, on prend X qui est déjà alignée
+            aligned_all = X.copy()
+
         if "MISSING_COUNT_ROW" in pool_df.columns:
-            s_missing = pd.to_numeric(pool_df["MISSING_COUNT_ROW"], errors="coerce")
+            # On part de la colonne fournie si elle existe...
+            s_missing = pd.Series(
+                pd.to_numeric(pool_df["MISSING_COUNT_ROW"], errors="coerce").values,
+                index=pool_df[ID_COL].values
+            )
+            # ...et on complète/fiabilise avec le calcul sur l'alignement exact des features du modèle
+            computed = aligned_all.isna().sum(axis=1)
+            s_missing = s_missing.reindex(computed.index)
+            s_missing = s_missing.fillna(computed)
         else:
-            cols_for_missing = [c for c in X.columns if c != TARGET_COL]
-            s_missing = pool_df[cols_for_missing].isna().sum(axis=1)
+            # Calcul robuste sur l'alignement exact des features du modèle
+            s_missing = aligned_all.isna().sum(axis=1)
 
         s_missing = s_missing.fillna(0)
+
         figm = go.Figure()
         figm.add_trace(go.Histogram(x=s_missing.values, nbinsx=50, name="Dossiers"))
-        try:
-            cli_val = float(
-                (pool_df.loc[pool_df[ID_COL] == selected_id, "MISSING_COUNT_ROW"].iloc[0])
-                if "MISSING_COUNT_ROW" in pool_df.columns
-                else (pool_df.loc[pool_df[ID_COL] == selected_id, X.columns].isna().sum(axis=1).iloc[0])
+
+        # Ligne verticale = valeur du client sélectionné (si dispo)
+        if selected_id in s_missing.index:
+            cli_val = float(s_missing.loc[selected_id])
+            figm.add_vline(
+                x=cli_val, line_color="red", line_dash="dash",
+                annotation_text=f"Client: {fmt_int(cli_val)}", annotation_position="top right"
             )
-            figm.add_vline(x=cli_val, line_color="red", line_dash="dash",
-                           annotation_text=f"Client: {fmt_int(cli_val)}", annotation_position="top right")
-        except Exception:
-            pass
-        figm.update_layout(xaxis_title="Champs manquants (par dossier)", yaxis_title="Fréquence", height=350, separators=", ")
+
+        figm.update_layout(
+            xaxis_title="Champs manquants (par dossier)",
+            yaxis_title="Fréquence",
+            height=350,
+            separators=", "
+        )
         st.plotly_chart(figm, use_container_width=True)
 
-        q10, q50, q90 = np.percentile(s_missing.values, [10,50,90])
+        q10, q50, q90 = np.percentile(s_missing.values, [10, 50, 90])
         st.caption(f"P10={fmt_int(q10)} • Médiane={fmt_int(q50)} • P90={fmt_int(q90)}")
     else:
         st.info("Données indisponibles pour cette analyse.")
@@ -959,8 +1031,7 @@ with main_tabs[4]:
                 series = pd.Series(X[f].dropna().astype(str))
                 mode = series.mode().iloc[0] if not series.empty else "NA"
                 opts = sorted(series.unique().tolist()[:50]) or ["NA"]
-                idx = opts.index(mode) if mode in opts else 0
-                inputs[f] = st.selectbox(f, options=opts, index=idx)
+                inputs[f] = st.selectbox(f, options=opts, index=(opts.index(mode) if mode in opts else 0))
 
         if st.button("Simuler"):
             new_x = pd.DataFrame([inputs])
@@ -972,12 +1043,9 @@ with main_tabs[4]:
                 new_x[c] = np.nan
         new_x = new_x[exp_cols]
 
-        st.session_state["last_new_client_row"] = new_x.copy()
-
         if mode == "API FastAPI":
             if not api_base or not api_ok:
                 st.error("API indisponible pour scorer le nouveau client.")
-                new_p, shap_df2 = None, None
             else:
                 try:
                     payload = {
@@ -987,12 +1055,15 @@ with main_tabs[4]:
                     resp = api_predict(api_base, payload)
                     new_p = float(resp["proba_default"])
                     shap_rows = resp.get("top_contrib") or []
-                    shap_df2 = (pd.DataFrame([{
-                        "feature": r["feature"],
-                        "shap_value": float(r["shap_value"]),
-                        "abs_val": abs(float(r["shap_value"])),
-                        "value": r["value"],
-                    } for r in shap_rows]) if shap_rows else None)
+                    if shap_rows:
+                        shap_df2 = pd.DataFrame([{
+                            "feature": r["feature"],
+                            "shap_value": float(r["shap_value"]),
+                            "abs_val": abs(float(r["shap_value"])),
+                            "value": r["value"],
+                        } for r in shap_rows])
+                    else:
+                        shap_df2 = None
                 except Exception as e:
                     st.error(f"API KO: {e}")
                     new_p, shap_df2 = None, None
@@ -1048,41 +1119,40 @@ with main_tabs[4]:
 
             with st.expander("🛠️ Axes d’amélioration (si décision = Refus)"):
                 if axes:
-                    st.dataframe(pd.DataFrame([{
+                    df_axes = pd.DataFrame([{
                         "Variable": a["feature"],
                         "Valeur": ("" if pd.isna(a["value"]) else a["value"]),
                         "Recommandation": a["note"],
-                    } for a in axes]), use_container_width=True)
+                    } for a in axes])
+                    st.dataframe(df_axes, use_container_width=True)
                 else:
                     st.info("Aucune recommandation spécifique (explicabilité locale indisponible).")
 
             with st.expander("🌟 Points forts"):
                 if strong:
-                    st.dataframe(pd.DataFrame([{
+                    df_strong = pd.DataFrame([{
                         "Variable": s["feature"],
                         "Valeur": ("" if pd.isna(s["value"]) else s["value"]),
                         "Commentaire": s["note"],
-                    } for s in strong]), use_container_width=True)
+                    } for s in strong])
+                    st.dataframe(df_strong, use_container_width=True)
                 else:
                     st.info("Non disponible (explicabilité locale indisponible).")
 
+            st.markdown("#### Contributions locales (SHAP) — top 10")
             if shap_df2 is not None and not shap_df2.empty:
                 tmp = shap_df2.copy().sort_values("abs_val", ascending=False).head(10)
-                tmp = tmp.assign(
-                    Effet=tmp["shap_value"].apply(lambda v: "↑ risque" if v > 0 else ("↓ risque" if v < 0 else "neutre")),
-                    SHAP=tmp["shap_value"].map(lambda v: f"{v:+.4f}"),
-                    Valeur=tmp["value"]
-                )[["feature", "Valeur", "SHAP", "Effet"]]
-                tmp.columns = ["Variable", "Valeur", "SHAP", "Effet"]
-                st.markdown("**Contributions locales (SHAP) — top 10**")
-                st.dataframe(tmp, use_container_width=True)
-
-                tmp2 = shap_df2.copy().sort_values("abs_val").tail(10)
-                x_vals = np.asarray(tmp2["shap_value"].values, dtype=float)
-                y_vals = tmp2["feature"].astype(str).tolist()
-                figb2 = go.Figure(go.Bar(x=x_vals, y=y_vals, orientation="h"))
-                figb2.update_layout(title="Impact sur le score (positif = ↑ risque)")
-                figb2.add_vline(x=0, line_width=1, line_dash="dash", line_color="black")
+                tmp["Effet"] = tmp["shap_value"].apply(lambda v: "↑ risque" if v > 0 else ("↓ risque" if v < 0 else "neutre"))
+                tmp2 = tmp[["feature", "value", "shap_value", "Effet"]].rename(columns={
+                    "feature": "Variable", "value": "Valeur", "shap_value": "SHAP"
+                })
+                st.dataframe(tmp2, use_container_width=True)
+                # Graphe
+                tmpg = tmp.sort_values("abs_val").copy()
+                figb2 = go.Figure(go.Bar(x=np.asarray(tmpg["shap_value"].values, dtype=float),
+                                         y=tmpg["feature"].astype(str).tolist(),
+                                         orientation="h"))
+                figb2.update_layout(title="Contributions locales (positif = ↑ risque)", separators=", ")
                 st.plotly_chart(figb2, use_container_width=True)
 
             st.divider()
@@ -1091,16 +1161,16 @@ with main_tabs[4]:
                 st.warning("Le module **reportlab** n'est pas installé. `pip install reportlab` puis relancez l'app.")
             else:
                 try:
-                    pdf_new = build_client_report_pdf(
-                        client_id="Nouveau client",
-                        model_name=f"{mode.split()[0]}",
-                        threshold=float(threshold),
+                    pdf_new = build_new_client_report_pdf(
                         proba=float(new_p),
-                        x_row=new_x,
+                        threshold=float(threshold),
+                        decision=decision,
+                        band_label=band2,
+                        new_x=new_x,
                         X=X,
                         pool_df=pool_df,
                         global_imp_df=global_imp_df,
-                        shap_vals=(shap_df2 if shap_df2 is not None and not shap_df2.empty else None),
+                        shap_df=shap_df2
                     )
                     fname = f"nouveau_client_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
                     st.download_button("📄 Télécharger le PDF (nouveau client)",
@@ -1110,193 +1180,9 @@ with main_tabs[4]:
                     st.error(f"Échec génération PDF nouveau client : {e}")
 
 # -------------------------------
-# Tab 6 — Dictionnaire des variables
+# Tab 6 — Seuil & coût métier
 # -------------------------------
-FEATURE_LABELS_SPEC = {
-    "SK_ID_CURR": "Identifiant client",
-    "CODE_GENDER": "Sexe",
-    "FLAG_OWN_CAR": "Possède une voiture",
-    "FLAG_OWN_REALTY": "Possède un bien immobilier",
-    "NAME_EDUCATION_TYPE": "Niveau d'éducation",
-    "NAME_INCOME_TYPE": "Type de revenu",
-    "NAME_FAMILY_STATUS": "Situation familiale",
-    "NAME_HOUSING_TYPE": "Type de logement",
-    "WEEKDAY_APPR_PROCESS_START": "Jour de la demande",
-    "ORGANIZATION_TYPE": "Secteur employeur",
-    "AGE_YEARS": "Âge (années)",
-    "EMPLOY_YEARS": "Ancienneté (années)",
-    "REG_YEARS": "Ancienneté à l'adresse (années)",
-    "AMT_CREDIT": "Montant du crédit",
-    "AMT_ANNUITY": "Mensualité du crédit",
-    "AMT_GOODS_PRICE": "Prix des biens financés",
-    "EXT_SOURCE_1": "Score externe 1",
-    "EXT_SOURCE_2": "Score externe 2",
-    "EXT_SOURCE_3": "Score externe 3",
-    "EXT_SOURCES_MEAN": "Moyenne des scores externes",
-    "EXT_SOURCES_SUM": "Somme des scores externes",
-    "EXT_SOURCES_NA": "Nb. scores externes manquants",
-    "PAYMENT_RATE": "Mensualité / Crédit",
-    "CREDIT_INCOME_RATIO": "Crédit / Revenu",
-    "ANNUITY_INCOME_RATIO": "Mensualité / Revenu",
-    "CREDIT_GOODS_RATIO": "Crédit / Biens",
-    "EMPLOY_TO_AGE_RATIO": "Ancienneté / Âge",
-    "INCOME_PER_PERSON": "Revenu par personne",
-    "CHILDREN_RATIO": "Enfants / Ménage",
-    "DOC_COUNT": "Nb. documents fournis",
-    "MISSING_COUNT_ROW": "Nb. champs manquants (ligne)",
-    "HOUSETYPE_MODE": "Type de logement (mode)",
-    "WALLSMATERIAL_MODE": "Matériaux des murs (mode)",
-    "FONDKAPREMONT_MODE": "Fonds de rénovation (mode)",
-    "NAME_TYPE_SUITE": "Accompagnant",
-    "NAME_CONTRACT_TYPE": "Type de contrat",
-    "REGION_RATING_CLIENT": "Indice région (rating)",
-    "AGE_BIN": "Tranche d'âge",
-}
-def french_label(col: str) -> str:
-    if col in FEATURE_LABELS_SPEC:
-        return FEATURE_LABELS_SPEC[col]
-    c = col.upper()
-    repl = [
-        ("AMT_", "Montant "), ("CNT_", "Nombre "), ("DAYS_", "Jours "),
-        ("YEARS", "Années"), ("HOUR", "Heure"), ("MIN", "Minute"), ("SEC", "Seconde"),
-        ("FLAG_", "Indicateur "), ("NAME_", "Libellé "), ("EXT_SOURCE_", "Score externe "),
-        ("EXT_SOURCES_", "Scores externes "), ("REGION_", "Région "),
-        ("ORGANIZATION_TYPE", "Secteur employeur"),
-        ("WEEKDAY_APPR_PROCESS_START", "Jour de la demande"),
-        ("SK_ID", "Identifiant "),
-    ]
-    label = c
-    for a, b in repl:
-        label = label.replace(a, b)
-    label = label.replace("__", " ").replace("_", " ").strip()
-    label = label.capitalize()
-    label = label.replace("Amt ", "Montant ").replace("Cnt ", "Nombre ")
-    label = label.replace("Indicateur own car", "Possède une voiture")
-    label = label.replace("Indicateur own realty", "Possède un bien immobilier")
-    label = label.replace("Libellé education type", "Niveau d'éducation")
-    label = label.replace("Libellé income type", "Type de revenu")
-    label = label.replace("Libellé family status", "Situation familiale")
-    label = label.replace("Libellé housing type", "Type de logement")
-    return label
-
 with main_tabs[5]:
-    st.subheader("Dictionnaire des variables")
-    if pool_df.empty:
-        st.info("Données indisponibles.")
-    else:
-        rows = []
-        for c in pool_df.columns:
-            rows.append({"Variable": c, "Nom (FR)": french_label(c), "Description": "—"})
-        dict_df = pd.DataFrame(rows)
-        st.dataframe(dict_df.sort_values("Variable"), use_container_width=True)
-
-# -------------------------------
-# Tab 7 — Ratios (feature engineering) avec calculs
-# -------------------------------
-def _safe_div(a, b):
-    try:
-        a = float(a); b = float(b)
-        if b == 0 or pd.isna(a) or pd.isna(b):
-            return np.nan
-        return a / b
-    except Exception:
-        return np.nan
-
-def _to_years(days):
-    try:
-        return max(0.0, -float(days)) / 365.25
-    except Exception:
-        return np.nan
-
-def compute_ratios_for_row(row: pd.Series) -> pd.DataFrame:
-    vals = {}
-    g = lambda k: row.get(k, np.nan)
-
-    vals["PAYMENT_RATE"]        = _safe_div(g("AMT_ANNUITY"), g("AMT_CREDIT"))
-    vals["CREDIT_INCOME_RATIO"] = _safe_div(g("AMT_CREDIT"), g("AMT_INCOME_TOTAL"))
-    vals["ANNUITY_INCOME_RATIO"]= _safe_div(g("AMT_ANNUITY"), g("AMT_INCOME_TOTAL"))
-    vals["CREDIT_GOODS_RATIO"]  = _safe_div(g("AMT_CREDIT"), g("AMT_GOODS_PRICE"))
-
-    s1, s2, s3 = g("EXT_SOURCE_1"), g("EXT_SOURCE_2"), g("EXT_SOURCE_3")
-    ext_list = [x for x in [s1, s2, s3] if pd.notna(x)]
-    vals["EXT_SOURCES_MEAN"] = (np.mean(ext_list) if ext_list else np.nan)
-    vals["EXT_SOURCES_SUM"]  = (np.sum(ext_list)  if ext_list else np.nan)
-    vals["EXT_SOURCES_NA"]   = 3 - len(ext_list)
-
-    age_years   = g("AGE_YEARS")
-    if pd.isna(age_years) and "DAYS_BIRTH" in row.index:
-        age_years = _to_years(g("DAYS_BIRTH"))
-    employ_years = g("EMPLOY_YEARS")
-    if pd.isna(employ_years) and "DAYS_EMPLOYED" in row.index:
-        employ_years = _to_years(g("DAYS_EMPLOYED"))
-    vals["AGE_YEARS"]   = age_years
-    vals["EMPLOY_YEARS"]= employ_years
-    vals["EMPLOY_TO_AGE_RATIO"] = _safe_div(employ_years, age_years)
-
-    vals["INCOME_PER_PERSON"] = _safe_div(g("AMT_INCOME_TOTAL"), g("CNT_FAM_MEMBERS"))
-    vals["CHILDREN_RATIO"]    = _safe_div(g("CNT_CHILDREN"), g("CNT_FAM_MEMBERS"))
-
-    vals["DOC_COUNT"]         = g("DOC_COUNT") if "DOC_COUNT" in row.index else np.nan
-    vals["MISSING_COUNT_ROW"] = g("MISSING_COUNT_ROW") if "MISSING_COUNT_ROW" in row.index else np.nan
-
-    out = []
-    for k, v in vals.items():
-        out.append({
-            "Variable": k,
-            "Valeur": v,
-            "Interprétation": {
-                "PAYMENT_RATE": "Part de la mensualité dans le crédit (faible = moindre pression).",
-                "CREDIT_INCOME_RATIO": "Charge du crédit vs revenu.",
-                "ANNUITY_INCOME_RATIO": "Mensualité vs revenu.",
-                "CREDIT_GOODS_RATIO": "≈1 sans apport ; <1 avec apport.",
-                "EXT_SOURCES_MEAN": "Moyenne des scores externes.",
-                "EXT_SOURCES_SUM": "Somme des scores externes.",
-                "EXT_SOURCES_NA": "Nombre de scores externes manquants.",
-                "AGE_YEARS": "Âge en années.",
-                "EMPLOY_YEARS": "Ancienneté pro en années.",
-                "EMPLOY_TO_AGE_RATIO": "Part de la vie passée en emploi.",
-                "INCOME_PER_PERSON": "Revenu par personne.",
-                "CHILDREN_RATIO": "Charge enfants / ménage.",
-                "DOC_COUNT": "Nombre de documents fournis.",
-                "MISSING_COUNT_ROW": "Champs manquants dans le dossier.",
-            }.get(k, "—")
-        })
-    df = pd.DataFrame(out)
-    def _fmt(v):
-        if pd.isna(v): return "—"
-        try: fv = float(v)
-        except Exception: return str(v)
-        if abs(fv) >= 1000: return fmt_num(fv, 0)
-        return fmt_num(fv, 4)
-    df["Valeur"] = df["Valeur"].map(_fmt)
-    return df
-
-with main_tabs[6]:
-    st.subheader("Ratios & variables dérivées (calculs réels)")
-    colA, colB = st.columns(2)
-    with colA:
-        st.markdown("**Client sélectionné**")
-        if x_row.empty:
-            st.info("Sélectionnez un client dans la barre latérale.")
-        else:
-            df_rat_cli = compute_ratios_for_row(x_row.iloc[0])
-            st.dataframe(df_rat_cli, use_container_width=True)
-    with colB:
-        st.markdown("**Dernier “Nouveau client” saisi**")
-        if "last_new_client_row" not in st.session_state:
-            st.info("Aucun nouveau client saisi pour l’instant (utilisez l’onglet *Nouveau client*).")
-        else:
-            try:
-                df_newrow = st.session_state["last_new_client_row"]
-                df_rat_new = compute_ratios_for_row(df_newrow.iloc[0])
-                st.dataframe(df_rat_new, use_container_width=True)
-            except Exception as e:
-                st.warning(f"Impossible d'afficher les ratios du nouveau client : {e}")
-
-# -------------------------------
-# Tab 8 — Seuil & coût métier
-# -------------------------------
-with main_tabs[7]:
     st.subheader("Seuil & coût métier (optimisation)")
     cols_opt = st.columns(4)
     with cols_opt[0]:
@@ -1316,7 +1202,7 @@ with main_tabs[7]:
             roc = m.get("roc", {})
             pr  = m.get("pr", {})
             cc  = m.get("cost_curve", {})
-            st.caption(f"Échantillon scoré côté API : **{fmt_int(m.get('n_scored', 0))}** lignes")
+            st.caption(f"Échantillon scoré côté API : **{m.get('n_scored', 0):,}** lignes".replace(",", " "))
 
             if roc.get("fpr") and roc.get("tpr"):
                 fpr = np.asarray(roc["fpr"], dtype=float)
@@ -1367,7 +1253,7 @@ with main_tabs[7]:
                     "Coût total": "—", "TP": "—", "FP": "—", "FN": "—", "TN": "—",
                     "Précision": "—", "Rappel": "—", "F1": "—",
                 }
-                st.dataframe(pd.DataFrame([best_row, cur_row], index=["Seuil optimal (API)", "Seuil courant"]), use_container_width=True)
+                st.dataframe(pd.DataFrame([best_row, cur_row], index=["Seuil optimal (API)", "Seuil courant"]))
             else:
                 st.info("Courbe de coût non disponible depuis l'API.")
         except Exception as e:
@@ -1390,8 +1276,8 @@ with main_tabs[7]:
                 X_all = df_lab[expected]
                 y_all = df_lab[TARGET_COL].astype(int)
 
-                if len(X_all) > 20000:
-                    X_all = X_all.sample(20000, random_state=42)
+                if len(X_all) > max_sample:
+                    X_all = X_all.sample(int(max_sample), random_state=42)
                     y_all = y_all.loc[X_all.index]
 
                 try:
@@ -1459,7 +1345,7 @@ with main_tabs[7]:
                         "Précision": f"{cur['precision']:.3f}", "Rappel": f"{cur['recall']:.3f}", "F1": f"{cur['f1']:.3f}",
                     }
                     st.markdown("**Synthèse**")
-                    st.dataframe(pd.DataFrame([best_row, cur_row], index=["Seuil optimal", "Seuil courant"]), use_container_width=True)
+                    st.dataframe(pd.DataFrame([best_row, cur_row], index=["Seuil optimal", "Seuil courant"]))
 
                     apply_cols = st.columns([1,2])
                     with apply_cols[0]:
