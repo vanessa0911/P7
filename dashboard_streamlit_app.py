@@ -1134,6 +1134,7 @@ with main_tabs[5]:
                     } for a in axes]), use_container_width=True)
                 else:
                     st.info("Aucune recommandation spécifique (explicabilité locale indisponible).")
+                    st.caption(f"DEBUG — axes={len(axes)}, strong={len(strong)}")
 
             with st.expander("🌟 Points forts"):
                 if strong:
