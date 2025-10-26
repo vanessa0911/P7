@@ -13,19 +13,17 @@ python -m streamlit run dashboard_streamlit_app.py --server.address 0.0.0.0 --se
 
 
 API base URL 
-https://p7-credit-api.onrender.com
+(https://p7youpi.onrender.com)
 
-https://p7-tentative2.onrender.com
-
-
+-----------
 
 Comment tester vite que tout est OK
 
-Va sur https://p7-tentative2.onrender.com/health → tu dois voir {"status":"ok"}.
+Va sur https://p7youpi.onrender.com/health → tu dois voir {"status":"ok"}. voir même : {"status":"ok","model_loaded":false,"feature_names_loaded":true,"clients_loaded":true,"model_path":"model_calibrated_isotonic.joblib"}
 
-Va sur https://p7-tentative2.onrender.com/info → tu dois voir les features, si le CSV est chargé, etc.
+Va sur https://p7youpi.onrender.com/info → tu dois voir les features, si le CSV est chargé, etc.
 
-Va sur https://p7-tentative2.onrender.com/ids → tu dois voir une petite liste d’IDs (si clients_demo.csv est bien chargé).
+Va sur https://p7youpi.onrender.com/ids → tu dois voir une petite liste d’IDs (si clients_demo.csv est bien chargé).
 
 Teste /predict (mode client_id) depuis ton ordi :
 
