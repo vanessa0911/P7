@@ -1,9 +1,9 @@
-# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v1.2.1)
+# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v1.2.2)
 # ----------------------------------------------------------------
 # Run:
 #   python -m streamlit run dashboard_streamlit_app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true
 
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 
 import os
 import json
@@ -77,7 +77,6 @@ def fmt_int(x: Any) -> str:
         return str(x)
     if abs(v - int(v)) < 1e-9:
         return f"{int(v):,}".replace(",", " ").replace(".", ",")
-    # 2 décimales si non entier
     return f"{v:,.2f}".replace(",", " ").replace(".", ",")
 
 def _pick_first_existing(paths: List[str]) -> Optional[str]:
@@ -157,11 +156,9 @@ def compute_local_shap(estimator, X_background: pd.DataFrame, x_row: pd.DataFram
     if len(bg) > 200:
         bg = bg.sample(200, random_state=42)
 
-    # fonction modèle : accepte DataFrame, renvoie proba défaut
     def f(Xdf):
         if not isinstance(Xdf, pd.DataFrame):
             Xdf = pd.DataFrame(Xdf, columns=list(bg.columns))
-        # Important : aligner les colonnes (ordre + manquantes)
         for c in bg.columns:
             if c not in Xdf.columns:
                 Xdf[c] = np.nan
@@ -321,7 +318,8 @@ def build_client_report_pdf(
     story.append(t2)
     story.append(Spacer(1, 8))
 
-    story.append(Paragraph("Variables clés", styles["H2"]]))
+    # 🔧 LIGNE CORRIGÉE ICI (suppression du ']' en trop)
+    story.append(Paragraph("Variables clés", styles["H2"]))
     if global_imp_df is not None and not global_imp_df.empty:
         keys = [f for f in global_imp_df["feature"].tolist() if f in X.columns][:20]
     else:
@@ -923,7 +921,7 @@ with main_tabs[2]:
                     figc.update_layout(
                         title=f"{grp} — Positionnement du client (P10/P50/P90)",
                         height=400,
-                        separators=", "  # décimale=',' ; milliers=' '
+                        separators=", "
                     )
                     st.plotly_chart(figc, use_container_width=True)
 
@@ -933,7 +931,6 @@ with main_tabs[2]:
 with main_tabs[3]:
     st.subheader("Qualité des données & valeurs manquantes")
 
-    # Image (si fournie)
     miss_fig = _pick_first_existing(["__results___5_1.png", "missing_train.png"])
     if miss_fig:
         st.image(miss_fig, caption="Top taux de valeurs manquantes (train)", use_container_width=True)
@@ -942,25 +939,20 @@ with main_tabs[3]:
 
     st.markdown("### Distribution du **nombre de champs manquants par dossier**")
     if not pool_df.empty:
-        # Aligner la population sur les colonnes d'entrée du modèle (X.columns), en ajoutant les colonnes manquantes
         try:
             aligned_all = pool_df.set_index(ID_COL).reindex(columns=X.columns)
         except Exception:
-            # fallback : si jamais set_index rate, on prend X qui est déjà alignée
             aligned_all = X.copy()
 
         if "MISSING_COUNT_ROW" in pool_df.columns:
-            # On part de la colonne fournie si elle existe...
             s_missing = pd.Series(
                 pd.to_numeric(pool_df["MISSING_COUNT_ROW"], errors="coerce").values,
                 index=pool_df[ID_COL].values
             )
-            # ...et on complète/fiabilise avec le calcul sur l'alignement exact des features du modèle
             computed = aligned_all.isna().sum(axis=1)
             s_missing = s_missing.reindex(computed.index)
             s_missing = s_missing.fillna(computed)
         else:
-            # Calcul robuste sur l'alignement exact des features du modèle
             s_missing = aligned_all.isna().sum(axis=1)
 
         s_missing = s_missing.fillna(0)
@@ -968,7 +960,6 @@ with main_tabs[3]:
         figm = go.Figure()
         figm.add_trace(go.Histogram(x=s_missing.values, nbinsx=50, name="Dossiers"))
 
-        # Ligne verticale = valeur du client sélectionné (si dispo)
         if selected_id in s_missing.index:
             cli_val = float(s_missing.loc[selected_id])
             figm.add_vline(
@@ -1147,7 +1138,6 @@ with main_tabs[4]:
                     "feature": "Variable", "value": "Valeur", "shap_value": "SHAP"
                 })
                 st.dataframe(tmp2, use_container_width=True)
-                # Graphe
                 tmpg = tmp.sort_values("abs_val").copy()
                 figb2 = go.Figure(go.Bar(x=np.asarray(tmpg["shap_value"].values, dtype=float),
                                          y=tmpg["feature"].astype(str).tolist(),
