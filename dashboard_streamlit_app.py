@@ -694,13 +694,13 @@ with main_tabs[4]:
         st.info("Figure de valeurs manquantes non trouvée.")
 
 # -------------------------------
-# Tab 6 — Nouveau client (what-if)
+# Tab 6 — Nouveau client
 # -------------------------------
 with main_tabs[5]:
-    st.subheader("Comparer un nouveau client (what-if)")
+    st.subheader("Comparer un nouveau client")
     st.markdown("Chargez un **CSV** (1 ligne) ou saisissez quelques variables clés pour simuler un nouveau client.")
     up = st.file_uploader("Fichier CSV (1 ligne)", type=["csv"], accept_multiple_files=False)
-    topk = st.slider("Nombre de variables clés à saisir (importance globale)", min_value=5, max_value=40, value=15, step=1)
+    topk = st.slider("Nombre de variables clés à saisir", min_value=5, max_value=40, value=15, step=1)
     manual = st.checkbox("Saisie manuelle des variables clés", value=False)
 
     new_x = None
@@ -793,27 +793,40 @@ with main_tabs[5]:
                     new_p, shap_df2 = None, None
 
         if new_p is not None:
-            def _band(p: float):
-                if p < 0.05: return ("Faible", "#3CB371")
-                if p < 0.15: return ("Modérée", "#E6B800")
-                return ("Élevée", "#E74C3C")
-            band2, color2 = _band(new_p)
-            fign = go.Figure(go.Indicator(
-                mode="gauge+number",
-                value=float(new_p) * 100.0,
-                number={"suffix": "%"},
-                gauge={"axis": {"range": [0, 100]}, "bar": {"color": color2}},
-                title={"text": f"Probabilité de défaut (nouveau client) — {mode.split()[0]}"},
-            ))
-            st.plotly_chart(fign, use_container_width=True)
-            if shap_df2 is not None and not shap_df2.empty:
-                tmp = shap_df2.copy()
-                tmp = tmp.sort_values("abs_val").tail(10)
-                x_vals = np.asarray(tmp["shap_value"].values, dtype=float)
-                y_vals = tmp["feature"].astype(str).tolist()
-                figb2 = go.Figure(go.Bar(x=x_vals, y=y_vals, orientation="h"))
-                figb2.update_layout(title="Contributions locales (SHAP) — top 10")
-                st.plotly_chart(figb2, use_container_width=True)
+    # Utilise le helper global défini plus haut
+    band2, color2 = prob_to_band(float(new_p), low=0.05, high=0.15)
+    decision = "Refus" if float(new_p) >= float(threshold) else "Accord"
+
+    fign = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=float(new_p) * 100.0,
+        number={"suffix": "%"},
+        gauge={
+            "axis": {"range": [0, 100]},
+            "bar": {"color": color2},
+            # Ombres comme sur l'onglet "Score & explication" pour matérialiser le seuil
+            "steps": [
+                {"range": [0, float(threshold) * 100.0], "color": "#ecf8f3"},
+                {"range": [float(threshold) * 100.0, 100], "color": "#fdecea"},
+            ],
+        },
+        title={"text": f"Probabilité de défaut (nouveau client) — {mode.split()[0]}"},
+    ))
+    st.plotly_chart(fign, use_container_width=True)
+
+    # ➕ Ajouts : décision & rappel du seuil
+    st.markdown(f"**Décision (seuil {float(threshold):.3f})** : **{decision}**")
+    st.markdown(f"Niveau de risque : **{band2}**")
+
+    # SHAP (inchangé)
+    if shap_df2 is not None and not shap_df2.empty:
+        tmp = shap_df2.copy().sort_values("abs_val").tail(10)
+        x_vals = np.asarray(tmp["shap_value"].values, dtype=float)
+        y_vals = tmp["feature"].astype(str).tolist()
+        figb2 = go.Figure(go.Bar(x=x_vals, y=y_vals, orientation="h"))
+        figb2.update_layout(title="Contributions locales (SHAP) — top 10")
+        st.plotly_chart(figb2, use_container_width=True)
+
 
 # -------------------------------
 # Tab 7 — Seuil & coût métier
