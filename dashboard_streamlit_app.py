@@ -1,9 +1,9 @@
-# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v0.9.11)
+# Streamlit Credit Scoring Dashboard — "Prêt à dépenser" (v0.9.12)
 # ----------------------------------------------------------------
 # Run:
 #   python -m streamlit run dashboard_streamlit_app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true
 
-APP_VERSION = "0.9.11"
+APP_VERSION = "0.9.12"
 
 import os
 import json
@@ -321,7 +321,6 @@ def build_client_report_pdf(
         ]
     else:
         tbl = [["Probabilité de défaut", "—"], ["Seuil", f"{threshold:.3f}"], ["Décision", "—"], ["Niveau de risque", "—"]]
-    from reportlab.platypus import Table, TableStyle
     t = Table(tbl, hAlign="LEFT", colWidths=[7*cm, 7*cm])
     t.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
@@ -334,14 +333,12 @@ def build_client_report_pdf(
     story.append(Spacer(1, 8))
 
     story.append(Paragraph("Importance globale (top 10)", styles["H2"]))
-    from reportlab.platypus import Table
     if global_imp_df is not None and not global_imp_df.empty:
         dfc = global_imp_df.head(10)
         data = [["Variable", "Importance"]] + [[str(r["feature"]), f'{r["importance"]:.4f}'] for _, r in dfc.iterrows()]
         t2 = Table(data, hAlign="LEFT", colWidths=[10*cm, 4*cm])
     else:
         t2 = Table([["Information", "Détail"], ["Importance globale", "Indisponible"]], hAlign="LEFT", colWidths=[10*cm, 4*cm])
-    from reportlab.platypus import TableStyle
     t2.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
         ("BOX", (0,0), (-1,-1), 0.25, colors.black),
@@ -353,7 +350,7 @@ def build_client_report_pdf(
     story.append(t2)
     story.append(Spacer(1, 8))
 
-    story.append(Paragraph("Variables clés", styles["H2"]]))
+    story.append(Paragraph("Variables clés", styles["H2"]))
     if global_imp_df is not None and not global_imp_df.empty:
         keys = [f for f in global_imp_df["feature"].tolist() if f in X.columns][:20]
     else:
@@ -363,9 +360,7 @@ def build_client_report_pdf(
     for f in keys:
         v = row[f] if f in row.index else np.nan
         kv.append([str(f), "" if pd.isna(v) else str(v)])
-    from reportlab.platypus import Table
     t3 = Table(kv, hAlign="LEFT", colWidths=[9*cm, 5*cm])
-    from reportlab.platypus import TableStyle
     t3.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f2f2f2")),
         ("BOX", (0,0), (-1,-1), 0.25, colors.black),
@@ -600,7 +595,6 @@ def build_new_client_report_pdf(
 
     story.append(Paragraph("Axes d’amélioration (si décision = Refus)", styles["H2"]))
     axes, strong, _ = suggest_actions(new_x, X, pool_df, top_n=5, global_imp_df=global_imp_df, debug=False)
-    from reportlab.platypus import Table, TableStyle
     if axes:
         data = [["Variable", "Valeur", "Recommandation"]]
         for a in axes:
@@ -657,7 +651,6 @@ MODEL_SIG  = _pick_first_existing(["model_calibrated_sigmoid.joblib"])
 MODEL_BASE = _pick_first_existing(["model_baseline_logreg.joblib"])
 FEATS_PATH = _pick_first_existing(["feature_names.npy"])
 GLOBIMP    = _pick_first_existing(["global_importance.csv"])
-INTERP_SUM = _pick_first_existing(["interpretability_summary.json"])
 
 with st.sidebar:
     # Diagnostics
@@ -730,14 +723,9 @@ if not pool_df.empty and selected_id is not None:
         expected_cols_local = get_expected_input_columns(model_local)
     if expected_cols_local is None:
         expected_cols_local = feature_names_file or list(df_idx.columns)
-    # ajoute colonnes manquantes + ordre exact
     df_idx = ensure_columns(df_idx, expected_cols_local)
     X = df_idx
-    # ligne client
-    if selected_id in X.index:
-        x_row = X.loc[[selected_id]]
-    else:
-        x_row = X.head(0)
+    x_row = X.loc[[selected_id]] if selected_id in X.index else X.head(0)
 else:
     X = pd.DataFrame(columns=feature_names_file)
     x_row = X.head(0)
@@ -1108,7 +1096,165 @@ with main_tabs[6]:
     with cols_opt[3]:
         max_sample = st.number_input("Taille échantillon (max)", min_value=1000, value=20000, step=1000)
 
-    # (Garde la logique d'optimisation locale/API d’origine si tu en avais besoin — non recopiée ici par souci de concision)
+    if mode == "API FastAPI" and api_ok:
+        try:
+            payload = {"cost_fp": float(cost_fp), "cost_fn": float(cost_fn), "max_sample": int(max_sample), "step": 0.001}
+            m = api_metrics(api_base, payload)
+            auc = float(m.get("auc", float("nan")))
+            roc = m.get("roc", {})
+            pr  = m.get("pr", {})
+            cc  = m.get("cost_curve", {})
+            st.caption(f"Échantillon scoré côté API : **{m.get('n_scored', 0):,}** lignes")
+
+            if roc.get("fpr") and roc.get("tpr"):
+                fpr = np.asarray(roc["fpr"], dtype=float)
+                tpr = np.asarray(roc["tpr"], dtype=float)
+                fig_roc = go.Figure()
+                fig_roc.add_trace(go.Scatter(x=fpr, y=tpr, mode="lines", name=f"ROC (AUC={auc:.3f})"))
+                fig_roc.add_trace(go.Scatter(x=np.asarray([0,1], dtype=float), y=np.asarray([0,1], dtype=float),
+                                             mode="lines", name="Random", line=dict(dash="dash")))
+                fig_roc.update_layout(title="Courbe ROC", xaxis_title="FPR", yaxis_title="TPR", height=350)
+                st.plotly_chart(fig_roc, use_container_width=True)
+
+            if pr.get("precision") and pr.get("recall"):
+                prec = np.asarray(pr["precision"], dtype=float)
+                rec  = np.asarray(pr["recall"], dtype=float)
+                fig_pr = go.Figure()
+                fig_pr.add_trace(go.Scatter(x=rec, y=prec, mode="lines", name="Precision-Recall"))
+                fig_pr.update_layout(title="Précision–Rappel", xaxis_title="Recall", yaxis_title="Precision", height=350)
+                st.plotly_chart(fig_pr, use_container_width=True)
+
+            thr = np.asarray(cc.get("threshold", []), dtype=float)
+            cst = np.asarray(cc.get("cost", []), dtype=float)
+            best = cc.get("best", {})
+            if len(thr) and len(cst) and best:
+                fig_cost = go.Figure()
+                fig_cost.add_trace(go.Scatter(x=thr, y=cst, mode="lines", name="Coût total"))
+                fig_cost.add_vline(x=float(best.get("threshold", 0.0)), line_width=2, line_dash="dash", line_color="green",
+                                   annotation_text=f"Seuil optimal = {float(best.get('threshold', 0.0)):.3f}",
+                                   annotation_position="top left")
+                fig_cost.add_vline(x=float(st.session_state["threshold"]), line_width=2, line_dash="dot", line_color="red",
+                                   annotation_text=f"Seuil courant = {st.session_state['threshold']:.3f}",
+                                   annotation_position="top right")
+                fig_cost.update_layout(title=f"Coût vs Seuil ({unit})", xaxis_title="Seuil",
+                                       yaxis_title=f"Coût total ({unit})", height=350)
+                st.plotly_chart(fig_cost, use_container_width=True)
+
+                st.markdown("**Synthèse (API)**")
+                best_row = {
+                    "Seuil": f"{float(best.get('threshold', 0.0)):.3f}",
+                    "Coût total": f"{float(best.get('cost', 0.0)):.0f} {unit}",
+                    "TP": int(best.get("tp", 0)), "FP": int(best.get("fp", 0)),
+                    "FN": int(best.get("fn", 0)), "TN": int(best.get("tn", 0)),
+                    "Précision": f"{float(best.get('precision', 0.0)):.3f}",
+                    "Rappel": f"{float(best.get('recall', 0.0)):.3f}",
+                    "F1": f"{float(best.get('f1', 0.0)):.3f}",
+                }
+                cur_row = {
+                    "Seuil": f"{st.session_state['threshold']:.3f}",
+                    "Coût total": "—", "TP": "—", "FP": "—", "FN": "—", "TN": "—",
+                    "Précision": "—", "Rappel": "—", "F1": "—",
+                }
+                st.dataframe(pd.DataFrame([best_row, cur_row], index=["Seuil optimal (API)", "Seuil courant"]))
+            else:
+                st.info("Courbe de coût non disponible depuis l'API.")
+        except Exception as e:
+            st.error(f"Échec récupération métriques API : {e}")
+    else:
+        # Mode Local
+        mdl_local = model_local
+        if mdl_local is None or X.empty or TARGET_COL is None or TARGET_COL not in pool_df.columns:
+            st.info("Pour optimiser le seuil en local, il faut : un **modèle local**, des **données** et la colonne **TARGET**.")
+        else:
+            labeled = pool_df.dropna(subset=[TARGET_COL]).copy()
+            if len(labeled) == 0:
+                st.warning("Aucune ligne labellisée trouvée (TARGET manquant).")
+            else:
+                df_lab = labeled.set_index(ID_COL)
+                expected = list(X.columns)
+                df_lab = ensure_columns(df_lab, expected)
+                X_all = df_lab[expected]
+                y_all = df_lab[TARGET_COL].astype(int)
+
+                if len(X_all) > max_sample:
+                    X_all = X_all.sample(int(max_sample), random_state=42)
+                    y_all = y_all.loc[X_all.index]
+
+                try:
+                    p_all = mdl_local.predict_proba(X_all)[:, 1]
+                except Exception as e:
+                    st.error(f"Impossible de scorer l'échantillon : {e}")
+                    p_all = None
+
+                if p_all is not None:
+                    try:
+                        auc = roc_auc_score(y_all.values, p_all)
+                    except Exception:
+                        auc = float("nan")
+
+                    try:
+                        fpr, tpr, roc_th = roc_curve(y_all.values, p_all)
+                        fig_roc = go.Figure()
+                        fig_roc.add_trace(go.Scatter(x=np.asarray(fpr, dtype=float),
+                                                     y=np.asarray(tpr, dtype=float),
+                                                     mode="lines", name=f"ROC (AUC={auc:.3f})"))
+                        fig_roc.add_trace(go.Scatter(x=np.asarray([0,1], dtype=float),
+                                                     y=np.asarray([0,1], dtype=float),
+                                                     mode="lines", name="Random", line=dict(dash="dash")))
+                        fig_roc.update_layout(title="Courbe ROC", xaxis_title="FPR", yaxis_title="TPR", height=350)
+                        st.plotly_chart(fig_roc, use_container_width=True)
+                    except Exception:
+                        pass
+
+                    try:
+                        prec, rec, pr_th = precision_recall_curve(y_all.values, p_all)
+                        fig_pr = go.Figure()
+                        fig_pr.add_trace(go.Scatter(x=np.asarray(rec, dtype=float),
+                                                    y=np.asarray(prec, dtype=float),
+                                                    mode="lines", name="Precision-Recall"))
+                        fig_pr.update_layout(title="Précision–Rappel", xaxis_title="Recall", yaxis_title="Precision", height=350)
+                        st.plotly_chart(fig_pr, use_container_width=True)
+                    except Exception:
+                        pass
+
+                    df_cost, best = cost_curve(y_all.values, p_all, cost_fp, cost_fn, step=0.001)
+                    fig_cost = go.Figure()
+                    fig_cost.add_trace(go.Scatter(x=np.asarray(df_cost["threshold"].values, dtype=float),
+                                                  y=np.asarray(df_cost["cost"].values, dtype=float),
+                                                  mode="lines", name="Coût total"))
+                    fig_cost.add_vline(x=float(best["threshold"]), line_width=2, line_dash="dash", line_color="green",
+                                       annotation_text=f"Seuil optimal = {best['threshold']:.3f}",
+                                       annotation_position="top left")
+                    fig_cost.add_vline(x=float(st.session_state["threshold"]), line_width=2, line_dash="dot", line_color="red",
+                                       annotation_text=f"Seuil courant = {st.session_state['threshold']:.3f}",
+                                       annotation_position="top right")
+                    fig_cost.update_layout(title=f"Coût vs Seuil ({unit})", xaxis_title="Seuil", yaxis_title=f"Coût total ({unit})", height=350)
+                    st.plotly_chart(fig_cost, use_container_width=True)
+
+                    cur = cost_at_threshold(y_all.values, p_all, float(st.session_state["threshold"]), cost_fp, cost_fn)
+                    best_row = {
+                        "Seuil": f"{best['threshold']:.3f}",
+                        "Coût total": f"{best['cost']:.0f} {unit}",
+                        "TP": int(best["tp"]), "FP": int(best["fp"]), "FN": int(best["fn"]), "TN": int(best["tn"]),
+                        "Précision": f"{best['precision']:.3f}", "Rappel": f"{best['recall']:.3f}", "F1": f"{best['f1']:.3f}",
+                    }
+                    cur_row = {
+                        "Seuil": f"{st.session_state['threshold']:.3f}",
+                        "Coût total": f"{cur['cost']:.0f} {unit}",
+                        "TP": int(cur["tp"]), "FP": int(cur["fp"]), "FN": int(cur["fn"]), "TN": int(cur["tn"]),
+                        "Précision": f"{cur['precision']:.3f}", "Rappel": f"{cur['recall']:.3f}", "F1": f"{cur['f1']:.3f}",
+                    }
+                    st.markdown("**Synthèse**")
+                    st.dataframe(pd.DataFrame([best_row, cur_row], index=["Seuil optimal", "Seuil courant"]))
+
+                    apply_cols = st.columns([1,2])
+                    with apply_cols[0]:
+                        if st.button("✅ Appliquer le seuil optimal au dashboard"):
+                            st.session_state["threshold"] = float(best["threshold"])
+                            st.success(f"Seuil mis à jour à {best['threshold']:.3f}.")
+                            st.rerun()
+                    with apply_cols[1]:
+                        st.caption("Le seuil optimal minimise le coût total attendu : `coût = FP × coût_FP + FN × coût_FN`.")
 
 # Footer
 st.divider()
