@@ -254,26 +254,6 @@ def api_metrics(base_url: str, payload: dict) -> dict:
     r.raise_for_status()
     return r.json()
 
-def safe_missing_count_for_selected(pool_df: pd.DataFrame, selected_id, ID_COL: str, candidate_cols: list[str]) -> tuple[int|None, pd.Series]:
-    """Retourne (valeur manquants pour le client sélectionné, série totale des manquants par ligne). Ne plante jamais."""
-    present = [c for c in candidate_cols if c in pool_df.columns]
-    if not present:
-        # Rien à compter → zéro partout
-        s_missing = pd.Series([0]*len(pool_df), index=pool_df.index, dtype="int64")
-    else:
-        s_missing = pool_df[present].isna().sum(axis=1)
-
-    val_sel = None
-    try:
-        if ID_COL and ID_COL in pool_df.columns and selected_id is not None:
-            mask = (pool_df[ID_COL] == selected_id)
-            if mask.any():
-                val_sel = int(s_missing.loc[mask].iloc[0])
-    except Exception:
-        val_sel = None
-    return val_sel, s_missing
-
-
 # -------------------------------
 # Variable dictionary (FR labels)
 # -------------------------------
@@ -877,52 +857,124 @@ main_tabs = st.tabs(TABS)
 # -------------------------------
 # Tab 1 — Score & explication
 # -------------------------------
-with main_tabs[4]:
-    st.subheader("Qualité des données & valeurs manquantes")
+with main_tabs[0]:
+    st.subheader("Score individuel & interprétation")
+    proba = None
+    shap_df = None
+    source_label = "Local"
 
-    # --- Image éventuelle (sans use_container_width) ---
-    miss_fig = _pick_first_existing(["__results___5_1.png", "missing_train.png"])
-    if miss_fig:
-        st.image(miss_fig, caption="Top taux de valeurs manquantes (train)")
-    else:
-        st.info("Figure de valeurs manquantes non trouvée.")
-
-    st.markdown("### Nombre de valeurs manquantes par ligne (MISSING_COUNT_ROW)")
-
-    # Colonnes “cœur” qu’on essaye de résumer ; on ne crash pas si certaines manquent
-    candidate_missing_cols = [
-        "AGE_YEARS","EMPLOY_YEARS","REG_YEARS",
-        "CREDIT_INCOME_RATIO","ANNUITY_INCOME_RATIO","CREDIT_TERM_MONTHS","PAYMENT_RATE","CREDIT_GOODS_RATIO",
-        "EXT_SOURCES_MEAN","EXT_SOURCES_SUM","EXT_SOURCES_NA",
-        "INCOME_PER_PERSON","CHILDREN_RATIO","DOC_COUNT",
-        "OWN_CAR_BOOL","OWN_REALTY_BOOL","EMPLOY_TO_AGE_RATIO","AGE_BIN"
-    ]
-
-    if pool_df.empty:
-        st.info("Données indisponibles.")
-    else:
-        val_sel, s_missing = safe_missing_count_for_selected(pool_df, selected_id, ID_COL, candidate_missing_cols)
-
-        c1, c2 = st.columns([1,3])
-        with c1:
-            st.metric("Manquants (ligne sélectionnée)", "—" if val_sel is None else f"{val_sel}")
-
-        with c2:
+    # PREDICT
+    if mode == "API FastAPI":
+        if not api_base or not api_ok:
+            st.error("API indisponible.")
+        else:
             try:
-                # Petit histogramme simple avec Plotly
-                import plotly.graph_objects as go
-                vals = s_missing.astype(int).tolist()
-                fig_miss = go.Figure(data=[go.Histogram(x=vals, nbinsx=max(10, int(np.sqrt(len(vals)))) )])
-                fig_miss.update_layout(
-                    title="Distribution du nombre de champs manquants / ligne",
-                    xaxis_title="Nombre de champs manquants",
-                    yaxis_title="Nombre de clients",
-                    height=300
-                )
-                st.plotly_chart(fig_miss, use_container_width=True)
+                payload = {"client_id": selected_id, "threshold": float(threshold), "shap": True, "topk": 10}
+                resp = api_predict(api_base, payload)
+                proba = float(resp["proba_default"])
+                source_label = "API"
+                if resp.get("top_contrib"):
+                    rows = []
+                    for r in resp["top_contrib"]:
+                        rows.append({
+                            "feature": r["feature"],
+                            "shap_value": float(r["shap_value"]),
+                            "abs_val": abs(float(r["shap_value"])),
+                            "value": r["value"],
+                        })
+                    shap_df = pd.DataFrame(rows)
             except Exception as e:
-                st.write("Distribution indisponible :", e)
+                st.warning(f"API KO ({e}). Bascule en Local si possible.")
+                if model_local is None:
+                    st.stop()
+                proba = float(model_local.predict_proba(x_row)[0, 1])
+    else:
+        if model_local is None or x_row.empty:
+            st.warning("Modèle local ou données indisponibles.")
+        else:
+            proba = float(model_local.predict_proba(x_row)[0, 1])
 
+    if proba is None:
+        st.stop()
+    band, color = prob_to_band(float(proba), low=0.05, high=0.15)
+
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        fig = go.Figure(go.Indicator(
+            mode="gauge+number",
+            value=float(proba) * 100.0,
+            number={"suffix": "%"},
+            gauge={"axis": {"range": [0, 100]},
+                   "bar": {"color": color},
+                   "steps": [
+                       {"range": [0, float(threshold) * 100.0], "color": "#ecf8f3"},
+                       {"range": [float(threshold) * 100.0, 100], "color": "#fdecea"},
+                   ]},
+            title={"text": "Probabilité de défaut"},
+        ))
+        st.plotly_chart(fig, use_container_width=True)
+        st.markdown(f"**Décision (seuil {threshold:.3f})** : **{'Refus' if proba >= threshold else 'Accord'}**")
+        st.markdown(f"Risque : **{band}**")
+        st.caption(f"Source: **{source_label}**")
+
+    with col2:
+        st.markdown("**Contributions locales (Top 10)**")
+
+        def _bar_from_df(df: pd.DataFrame, title: str) -> go.Figure:
+            tmp = df.copy()
+            tmp = tmp.sort_values("abs_val").tail(10)
+            x_vals = np.asarray(tmp["shap_value"].values, dtype=float)
+            y_vals = tmp["feature"].astype(str).tolist()
+            hover = [f"valeur: {v}" for v in tmp["value"]]
+            figb = go.Figure(go.Bar(x=x_vals, y=y_vals, orientation="h", hovertext=hover, hoverinfo="text+x+y"))
+            figb.update_layout(title=title, xaxis=dict(zeroline=True, zerolinewidth=1))
+            return figb
+
+        if mode == "API FastAPI" and shap_df is not None and not shap_df.empty:
+            st.plotly_chart(_bar_from_df(shap_df, "Impact sur le score (positif = ↑ risque)"), use_container_width=True)
+        else:
+            shap_enabled = st.toggle("Activer SHAP local (expérimental)", value=False)
+            if shap_enabled and not background.empty and model_local is not None:
+                try:
+                    vals, base_vals, cols_num, row_vals = compute_local_shap(model_local, background, x_row)
+                    shap_df_local = pd.DataFrame({
+                        "feature": cols_num,
+                        "shap_value": vals,
+                        "abs_val": np.abs(vals),
+                        "value": row_vals,
+                    }).sort_values("abs_val", ascending=False)
+                    st.plotly_chart(_bar_from_df(shap_df_local, "Impact sur le score (positif = ↑ risque)"),
+                                    use_container_width=True)
+                except Exception as e:
+                    st.warning(f"SHAP local indisponible: {e}")
+            else:
+                if global_imp_df is not None and not global_imp_df.empty:
+                    tmp = global_imp_df.head(10).copy()
+                    x_vals = np.asarray(tmp["importance"].values, dtype=float)
+                    y_vals = tmp["feature"].astype(str).tolist()
+                    figb = go.Figure(go.Bar(x=x_vals, y=y_vals, orientation="h"))
+                    figb.update_layout(title="Top 10 — Importance globale")
+                    st.plotly_chart(figb, use_container_width=True)
+                else:
+                    st.info("Importance globale indisponible.")
+
+    st.divider()
+    st.subheader("📄 Export")
+    if not REPORTLAB_AVAILABLE:
+        st.warning("Le module **reportlab** n'est pas installé. `pip install reportlab` puis relancez l'app.")
+    else:
+        try:
+            client_id_str = str(selected_id) if selected_id is not None else "NA"
+            pdf_bytes = build_client_report_pdf(
+                client_id=client_id_str, model_name=f"{source_label}", threshold=float(threshold),
+                proba=proba, x_row=x_row, X=X, pool_df=pool_df, global_imp_df=global_imp_df,
+                shap_vals=(shap_df if shap_df is not None and not shap_df.empty else None),
+            )
+            filename = f"fiche_client_{client_id_str}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+            st.download_button("📄 Exporter la fiche client (PDF)", data=pdf_bytes, file_name=filename, mime="application/pdf",
+                               use_container_width=True)
+        except Exception as e:
+            st.error(f"Échec de la génération du PDF : {e}")
 
 # -------------------------------
 # Tab 2 — Fiche client
