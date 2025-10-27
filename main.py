@@ -76,13 +76,21 @@ class PredictResponse(BaseModel):
     decision: str
     threshold: float
 
+# main.py
+import os
+import uvicorn
+from fastapi import FastAPI
+
+app = FastAPI()
+
 @app.get("/health")
 def health():
-    return {"status":"ok",
-            "model_loaded": model is not None,
-            "feature_names_loaded": feature_names is not None,
-            "clients_loaded": clients_df is not None,
-            "model_path": MODEL_PATH}
+    return {"ok": True}
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
+
 
 def df_from_features(d: Dict[str, Any]) -> pd.DataFrame:
     df = pd.DataFrame([d])
