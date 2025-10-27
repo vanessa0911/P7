@@ -107,6 +107,11 @@ def align(df: pd.DataFrame) -> pd.DataFrame:
         return out
     return df
 
+@app.get("/")
+def root():
+    return {"status": "up"}
+
+
 @app.post("/predict", response_model=PredictResponse)
 def predict(req: PredictRequest):
     if model is None:
